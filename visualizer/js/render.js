@@ -10,10 +10,13 @@
 		String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 	const fmtTok = (n) => (n >= 1000 ? (n / 1000).toFixed(n >= 100000 ? 0 : 1) + "k" : String(n));
 	const ROLE = {
-		user: { icon: "◢", label: "you", cls: "role-user" },
-		assistant: { icon: "✦", label: "agent", cls: "role-asst" },
-		tool: { icon: "▣", label: "tool", cls: "role-tool" },
-		system: { icon: "❖", label: "system", cls: "role-sys" },
+		user: { icon: "U", label: "you", cls: "role-user" },
+		assistant: { icon: "A", label: "agent", cls: "role-asst" },
+		tool: { icon: "T", label: "tool", cls: "role-tool" },
+		system: { icon: "S", label: "system", cls: "role-sys" },
+	};
+	const ICON = {
+		layers: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 5-9 5-9-5 9-5zM3 13l9 5 9-5"/></svg>',
 	};
 
 	function longText(text, cls) {
@@ -31,12 +34,12 @@
 				if (b.type === "text") {
 					html += `<div class="blk text ${m.role === "user" ? "uin" : ""}">${longText(b.text, "ptext")}</div>`;
 				} else if (b.type === "thinking") {
-					html += `<details class="blk thinking"><summary>✷ thinking</summary><pre class="ptext">${esc(b.text)}</pre></details>`;
+					html += `<details class="blk thinking"><summary>thinking</summary><pre class="ptext">${esc(b.text)}</pre></details>`;
 				} else if (b.type === "tool_call") {
 					const args = esc(U.clip(JSON.stringify(b.args || {}), 240));
-					html += `<div class="blk call"><span class="cname">⚙ ${esc(b.name)}</span><code class="cargs">${args}</code></div>`;
+					html += `<div class="blk call"><span class="cname">${esc(b.name)}</span><code class="cargs">${args}</code></div>`;
 				} else if (b.type === "tool_result") {
-					html += `<div class="blk result ${b.isError ? "err" : ""}"><div class="rhead">▣ ${esc(b.name)}${b.isError ? " · error" : ""}</div>${longText(b.text, "ptext")}</div>`;
+					html += `<div class="blk result ${b.isError ? "err" : ""}"><div class="rhead">${esc(b.name)}${b.isError ? " · error" : ""}</div>${longText(b.text, "ptext")}</div>`;
 				} else if (b.type === "note") {
 					html += `<div class="blk note">${esc(b.text)}</div>`;
 				}
@@ -58,7 +61,7 @@
 		const roles = [...new Set(s.messages.map((m) => m.role))];
 		const model = (s.messages.find((m) => m.model) || {}).model || "";
 		const stateBadge = s.pinned
-			? `<span class="badge pin">📌 pinned</span>`
+			? `<span class="badge pin">pinned</span>`
 			: folded
 				? `<span class="badge folded">folded ${whoBadge(s.by)}</span>`
 				: `<span class="badge full">full ${s.by ? whoBadge(s.by) : ""}</span>`;
@@ -94,8 +97,8 @@
 		return `
 <div class="group" data-gid="${g.id}">
   <div class="ghead" data-act="toggleGroup" data-gid="${g.id}">
-    <span class="gicon">🗂</span>
-    <span class="gtitle">Folded group · ${secs.length} sections (${span})</span>
+    <span class="gicon">${ICON.layers}</span>
+    <span class="gtitle">${secs.length} turns folded · ${span}</span>
     <span class="tok">${fmtTok(tok)} tok</span>
     <span class="badge group">grouped ${whoBadge(g.by)}</span>
     <span class="actions"><button data-act="toggleGroup" data-gid="${g.id}">expand</button></span>
@@ -120,7 +123,7 @@
         <span class="bb-win">${fmtTok(win)}</span>
       </div>
       <div class="bb-track"><div class="bb-fill ${over ? "over" : ""}" style="width:${pct}%"></div></div>
-      <div class="bb-meta">full session <b>${fmtTok(total)}</b> tok · accordion is saving <b>${fmtTok(saved)}</b> (${savedPct}%)${over ? ` · <span class="warn">over window — fold or run the Conductor</span>` : ""}</div>`;
+      <div class="bb-meta">full manuscript <b>${fmtTok(total)}</b> tok · folded away <b>${fmtTok(saved)}</b> (${savedPct}%) — still recoverable${over ? ` · <span class="warn">over window — fold, or let the Conductor in</span>` : ""}</div>`;
 
 		// sections (collapsed groups render once at their first member)
 		const out = [];

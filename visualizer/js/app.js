@@ -51,8 +51,8 @@
 
 	// ---- sample discovery (works when served; silently skipped on file://) ---
 	const CANDIDATES = [
-		{ path: "samples/local/real-omp.jsonl", label: "★ real OMP session" },
-		{ path: "samples/local/real-claude.jsonl", label: "★ real Claude Code session" },
+		{ path: "samples/local/real-omp.jsonl", label: "real OMP session" },
+		{ path: "samples/local/real-claude.jsonl", label: "real Claude Code session" },
 		{ path: "samples/synthetic-arsenal.jsonl", label: "synthetic sample" },
 	];
 
@@ -88,7 +88,7 @@
 
 	// ---- replay: watch the session grow and the Conductor keep it in budget --
 	function stopReplay() {
-		if (replayTimer) { clearInterval(replayTimer); replayTimer = null; $("replay").textContent = "▶ replay"; }
+		if (replayTimer) { clearInterval(replayTimer); replayTimer = null; $("replay").textContent = "replay"; }
 	}
 	function startReplay() {
 		if (!store) return;
@@ -96,7 +96,7 @@
 		if (store.sections.length <= 2) { toast("Replay needs a longer session."); return; }
 		store.expandAll();
 		store.revealUpTo = 1;
-		$("replay").textContent = "⏸ pause";
+		$("replay").textContent = "pause";
 		App.render(store);
 		replayTimer = setInterval(() => {
 			if (!store) return stopReplay();

@@ -9,10 +9,10 @@
 <body>
 	<header class="topbar">
 		<div class="brand">
-			<span class="logo">🪗</span>
+			<span class="logo" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M4 5h16M4 8.6h16M4 12.6h16M4 15.4h16M4 17.6h16"/></svg></span>
 			<div>
 				<div class="bname">Accordion</div>
-				<div class="btag">context window visualizer · demo</div>
+				<div class="btag">the agent's context, as a manuscript you fold · demo</div>
 			</div>
 		</div>
 		<div id="budgetbar" class="budgetbar"></div>
@@ -25,11 +25,11 @@
 			<label class="filebtn">open file…<input id="fileInput" type="file" accept=".jsonl,.json,.txt" hidden /></label>
 		</div>
 		<div class="ctrls">
-			<button id="conductor" class="primary" title="Auto-fold/unfold so the live context fits the window">▶ Conductor</button>
-			<button id="group" title="Fold the leading run of folded sections into one group (fold the folds)">🗂 group folds</button>
+			<button id="conductor" class="primary" title="Auto-fold/unfold so the live context fits the window"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8 5l11 7-11 7z"/></svg>run conductor</button>
+			<button id="group" title="Fold the leading run of folded sections into one group (fold the folds)">group folds</button>
 			<button id="foldCold" title="Fold everything except the last two turns">fold cold</button>
 			<button id="expandAll" title="Unfold everything">expand all</button>
-			<button id="replay" title="Watch the session grow and the Conductor keep it in budget">▶ replay</button>
+			<button id="replay" title="Watch the session grow and the Conductor keep it in budget">replay</button>
 			<label class="winlab" title="The size of the model's context window">
 				window <input id="windowRange" type="range" min="1000" max="300000" step="1000" value="200000" /><span id="windowVal">200k</span>
 			</label>
