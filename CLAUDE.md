@@ -4,6 +4,12 @@ Guidance for AI coding sessions in this repo. Read [VISION.md](VISION.md) for th
 product north star and [README.md](README.md) for the short pitch. This file is
 about **how to work in the code**, not what the product is.
 
+## Key URLs
+
+- **Marketing site:** https://get-accordion.dev/
+- **Public GitHub repo:** https://github.com/a-Fig/Accordion
+- **Private GitHub repo:** https://github.com/a-Fig/accordion-private
+
 ## Where the live work is
 
 The active surface is the **desktop app** in `app/` — a Tauri 2 + SvelteKit window
