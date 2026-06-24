@@ -12,6 +12,7 @@
 
 <img src="docs/assets/accordion-hero.gif" alt="Accordion — the context map demo: blocks folding and unfolding while the protected tail stays intact" width="820">
 
+<sub>Your whole context window split in 2 sections. The lower section represents your agents most recent context and is protected against any interference</sub>
 </div>
 
 ---
@@ -23,21 +24,18 @@ your agent's entire context window at a glance and lets you manage it manually o
 
 <a href="docs/assets/accordion-demo.mp4"><img src="docs/assets/map-hero.png" alt="Accordion's context Map — a live pi session rendered as a grid of colored blocks" width="860"></a>
 
-<sub>Your whole context window split in 2 sections. The lower section represents your agents most recent context and is protected against any interference</sub>
-
 </div>
 
 ## Why it's different
 
 #### 1. No blocking calls for compaction 
-your context window is automatically managed for you in the background, with cashe optimizations in mind.
+> your context window is automatically managed for you in the background, keeping you below your limit
 
 #### 2. longer more useful sessions
-The relevance of each block is ranked so we only cut bloat, and keep whats important. 
+> The relevance of each block is ranked so we only fold bloat, and keep whats important. 
 
 #### 3. Cheaper inference costs
-Accordion keeps your context window lean.
-
+> Accordion keeps your context window lean, with cashe optimizations in mind.
 
 Every long-running agent hits the same wall: the context fills up, and something has to
 go. Today's answers are dumb and dumber:
@@ -45,8 +43,6 @@ go. Today's answers are dumb and dumber:
 - **Compaction** blasts your whole history into one lossy summary — slow, destructive,
   all-or-nothing.
 - **Sliding windows** just drop the oldest tokens — the agent simply forgets.
-
-Both treat context as a buffer to flush. You never saw it go, and you can't get it back.
 
 | | Sliding window | `/compact` | skills & memory | 🪗 Accordion |
 |---|:---:|:---:|:---:|:---:|
@@ -57,26 +53,23 @@ Both treat context as a buffer to flush. You never saw it go, and you can't get 
 | You can see and steer it | ❌ | ❌ | ❌ | ✅ |
 | No extra infra (no vector DB) | ✅ | ✅ | ❌ | ✅ |
 
-Context isn't a buffer. It's an accordion.
+## The proof — early, but pointed
 
-## Quick start
+Accordion ships with a catalog of pluggable **Conductors**. The strongest so far,
+**[Thermocline](conductors/thermocline/)**, scores each block's "temperature" with a small
+(0.5B-parameter) attention probe and compacts coldest-first under a hard token budget —
+attention decides order, the budget decides depth.
 
-Accordion attaches to a **live pi session** and watches its context update in real time.
+In an early run on **SlopCodeBench** (a long-horizon coding benchmark), Thermocline at a
+100k-token budget cleared far more of the task than with the same constrained context budget:
 
-```bash
-cd app && npm install && npm run tauri dev
-```
+| Conductor | Context Budget | Score | Checkpoints reached |
+|---|:---:|:---:|:---:|
+| **Thermocline** | 100k | **83.3%** | 5 / 6 |
+| naive compaction | 100k | 33.3% | 2 / 6 |
 
-Register the extension in `~/.pi/agent/settings.json`:
-
-```json
-{ "extensions": ["<path-to-this-repo>/extension/accordion.ts"] }
-```
-
-Now run `pi` in any project. It shows up in Accordion's **Sessions** sidebar within a
-second — click it (or run `/accordion` in that terminal) and watch its context populate
-live. Folding is **off by default**; flip the header toggle to arm it and start steering
-what the agent is shown.
+> ⚠️ **Read this as a signal, not a guarantee.** It's a single hackathon-scale run on one
+> problem set — not a published benchmark. Broader, repeatable evaluation is on the roadmap.
 
 ## How it works
 
@@ -111,24 +104,6 @@ agent reasons over at full fidelity (the thick-bordered box below the fold line)
 
 → Capability matrix, full walkthrough, and the deep spec: **[VISION.md](VISION.md)**
 
-## The proof — early, but pointed
-
-Accordion ships with a catalog of pluggable **Conductors**. The strongest so far,
-**[Thermocline](conductors/thermocline/)**, scores each block's "temperature" with a small
-(0.5B-parameter) attention probe and compacts coldest-first under a hard token budget —
-attention decides order, the budget decides depth.
-
-In an early run on **SlopCodeBench** (a long-horizon coding benchmark), Thermocline at a
-100k-token budget cleared far more of the task than naive compaction at the same budget:
-
-| Conductor | Budget | Score | Checkpoints reached |
-|---|:---:|:---:|:---:|
-| **Thermocline** | 100k | **83.3%** | 5 / 6 |
-| naive compaction | 100k | 33.3% | 2 / 6 |
-
-> ⚠️ **Read this as a signal, not a guarantee.** It's a single hackathon-scale run on one
-> problem set — not a published benchmark. Broader, repeatable evaluation is on the roadmap.
-
 ## What works today
 
 - ✅ Desktop app (Tauri + SvelteKit): the Map view, token budget, inspector, protected
@@ -159,6 +134,25 @@ groups, no replay. That's the build ahead.
 - [ ] Replay — scrub how context evolved across a session
 - [ ] Better conductors — research, develop, and test stronger context strategies
 - [ ] Expand accordion beyond pi
+
+## Quick start
+
+Accordion runs in your browser or on your desktop as a tauri app. Some conductors are only available in the app as they require additional resources to run.
+
+```bash
+cd app && npm install && npm run tauri dev
+```
+
+Register the extension in `~/.pi/agent/settings.json`:
+
+```json
+{ "extensions": ["<path-to-this-repo>/extension/accordion.ts"] }
+```
+
+Now run `pi` in any project. It shows up in Accordion's **Sessions** sidebar within a
+second — click it (or run `/accordion` in that terminal) and watch its context populate
+live. Folding is **off by default**; flip the header toggle to arm it and start steering
+what the agent is shown.
 
 ## Contributing
 
