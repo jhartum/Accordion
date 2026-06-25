@@ -55,13 +55,11 @@ go. Today's answers are dumb and dumber:
 
 ## The proof — early, but pointed
 
-Accordion ships with a catalog of pluggable **Conductors**. The strongest so far,
-**[Thermocline](conductors/thermocline/)**, scores each block's "temperature" with a small
-(0.5B-parameter) attention probe and compacts coldest-first under a hard token budget —
-attention decides order, the budget decides depth.
+Accordion ships with a catalog of interchangeable **Conductors**. The strongest so far,
+**[Thermocline](conductors/thermocline/)**, scores each block relevance to the most recent context using the attention from a 500M parameter model as a proxy.
 
-In an early run on **SlopCodeBench** (a long-horizon coding benchmark), Thermocline at a
-100k-token budget cleared far more of the task than with the same constrained context budget:
+In a test run on **SlopCodeBench** (a long-horizon coding benchmark), Thermocline at a
+100k-token budget outperformed naive compaction with the same constrained context budget. Both used deepseekV4Pro.
 
 | Conductor | Context Budget | Score | Checkpoints reached |
 |---|:---:|:---:|:---:|
@@ -69,7 +67,7 @@ In an early run on **SlopCodeBench** (a long-horizon coding benchmark), Thermocl
 | naive compaction | 100k | 33.3% | 2 / 6 |
 
 > ⚠️ **Read this as a signal, not a guarantee.** It's a single hackathon-scale run on one
-> problem set — not a published benchmark. Broader, repeatable evaluation is on the roadmap.
+> subset of the problems — not a published benchmark. Broader, repeatable evaluation is on the roadmap.
 
 ## How it works
 
