@@ -137,28 +137,19 @@ groups, no replay. That's the build ahead.
 
 ### Part 1 — Browser (no Rust, no desktop app)
 
-The fastest path. The pi extension HTTP-serves Accordion in your browser — no Rust, no
-desktop app needed. Single session only.
+The fastest path. `pi install` the published package and the pi extension HTTP-serves
+Accordion in your browser — no clone, no build, no Rust. Single session only.
 
-**1. Clone, build the browser UI, and install the extension:**
+**1. Install the package:**
 
 ```bash
-git clone https://github.com/a-Fig/accordion.git
-cd accordion
-npm install --prefix app && npm run build --prefix app   # builds the static browser bundle (app/build)
-cd extension && npm install                              # the pi extension that serves it
+pi install npm:@a-fig/accordion
 ```
 
-> The extension serves the UI from `app/build` (produced by `npm run build` above).
-> Without that build, `/accordion` opens to a "No browser build found" page.
+This adds `npm:@a-fig/accordion` to `~/.pi/agent/settings.json` (the extension, the
+browser UI, and the `unfold` / `recall` skills are all in the package).
 
-**2. Register it with pi** — add to `~/.pi/agent/settings.json`:
-
-```json
-{ "extensions": ["<absolute-path-to-repo>/extension/accordion.ts"] }
-```
-
-**3. Run pi in any project, then open Accordion in your browser:**
+**2. Restart pi**, then in any project run:
 
 ```bash
 /accordion   # prints the local URL and opens it
@@ -166,6 +157,9 @@ cd extension && npm install                              # the pi extension that
 
 That's it. The page auto-connects to the running session. Folding is **off by default**;
 flip the **Folding** toggle in the header to start steering what the agent sees.
+
+> To try it without writing to settings, use `pi -e npm:@a-fig/accordion` (installs to a
+> temporary directory for the current run only).
 
 ---
 
@@ -187,7 +181,7 @@ git clone https://github.com/a-Fig/accordion.git
 cd accordion/app && npm install
 ```
 
-**2. Register the extension with pi** — same as above, in `~/.pi/agent/settings.json`:
+**2. Register the extension with pi** — add to `~/.pi/agent/settings.json`:
 
 ```json
 { "extensions": ["<absolute-path-to-repo>/extension/accordion.ts"] }
