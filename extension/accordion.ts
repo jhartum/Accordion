@@ -130,6 +130,7 @@ const FOCUS_PATH = path.join(REGISTRY_ROOT, FOCUS_FILE);
 
 const ACCORDION_APP_FLAG = "accordion-app";
 const ACCORDION_APP_ENV = "ACCORDION_APP_PATH";
+const ACCORDION_PORT_ENV = "ACCORDION_PORT";
 
 type LaunchSource = "cli" | "env" | "default";
 type LaunchResult =
@@ -661,6 +662,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			// One HTTP server hosts BOTH halves on the SAME ephemeral port:
 			//   • HTTP GETs → handleHttp (the browser build, token-gated)
 			//   • WS upgrades → the WebSocketServer below (UNAUTHENTICATED, unchanged)
+			// ACCORDION_PORT env ⇒ fixed port (for Tailscale Serve, reverse proxy, etc.)
 			// port 0 ⇒ OS assigns a free ephemeral port (one server per pi session).
 			httpServer = http.createServer(handleHttp);
 			// Attach the WS server to the HTTP server (NOT { port: 0 }) so the upgrade
@@ -672,7 +674,8 @@ export default function accordionLive(pi: ExtensionAPI): void {
 				httpServer = null;
 				wss = null;
 			});
-			httpServer.listen(0, "127.0.0.1", () => {
+			const bindPort = parseInt(process.env[ACCORDION_PORT_ENV], 10) || 0;
+			httpServer.listen(bindPort, "0.0.0.0", () => {
 				const addr = httpServer?.address();
 				if (addr && typeof addr === "object") {
 					port = addr.port;
