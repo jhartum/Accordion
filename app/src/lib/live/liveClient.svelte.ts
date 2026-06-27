@@ -185,13 +185,17 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 	disconnectLive(); // drop any prior socket
 	manualClose = false;
 	live.status = "connecting";
-	live.detail = `ws://127.0.0.1:${port}`;
+	// Use window.location.hostname as the WS host when served remotely (browser-host
+	// mode accessed across the network — e.g. a WSL pi reached from a laptop over
+	// Tailscale). Default to 127.0.0.1 for the desktop Tauri app or non-DOM contexts.
+	const wsHost = typeof window !== "undefined" && window.location.hostname ? window.location.hostname : "127.0.0.1";
+	live.detail = `ws://${wsHost}:${port}`;
 	live.sessionId = null;
 	session.error = "";
 
 	let ws: WebSocket;
 	try {
-		ws = new WebSocket(`ws://127.0.0.1:${port}`);
+		ws = new WebSocket(`ws://${wsHost}:${port}`);
 	} catch (e) {
 		live.status = "error";
 		live.detail = e instanceof Error ? e.message : String(e);
