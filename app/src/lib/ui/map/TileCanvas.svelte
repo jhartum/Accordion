@@ -99,6 +99,9 @@
 	let sprites: Map<number, HTMLCanvasElement> | null = null;
 	let dpr = 1;
 	let ro: ResizeObserver | null = null;
+	// Coalesces the parent's ResizeObserver into one rAF (see onMount comment).
+	// Held in module scope so onMount + onDestroy share the same handle; null = no pending frame.
+	let resizeRaf: number | null = null;
 
 	// DPR-change watcher — handles browser zoom / display migration without a CSS resize.
 	// We keep a reference to the active mql + its handler so onDestroy can clean up,
@@ -451,14 +454,28 @@
 		sprites = buildSprites(dpr);
 
 		// ResizeObserver on the canvas's parent to track container width.
+		// Coalesced into a single rAF (mirrors ContextMap.fit): a window drag fires
+		// the observer dozens of times per second; without batching, each entry
+		// flipped `containerWidth`, re-ran the geometry $effect, and triggered a full
+		// resizeCanvas + redraw. The synchronous redraw is the right way to avoid the
+		// blank-frame between canvas.width = X and the next paint, but it is not free
+		// (982 tiles); stacking 5-10 of them per frame reads as flicker on its own.
+		// One read per animation frame keeps the main thread clear while still
+		// running the canvas update inside the same frame as the layout that caused
+		// it (the rAF fires before paint).
 		if (canvas?.parentElement) {
 			ro = new ResizeObserver((entries) => {
-				for (const entry of entries) {
-					const newWidth = entry.contentRect.width;
-					if (Math.abs(newWidth - containerWidth) > 0.5) {
-						containerWidth = newWidth;
+				if (resizeRaf !== null) return;
+				resizeRaf = requestAnimationFrame(() => {
+					resizeRaf = null;
+					for (const entry of entries) {
+						const newWidth = entry.contentRect.width;
+						if (Math.abs(newWidth - containerWidth) > 0.5) {
+							containerWidth = newWidth;
+							break; // one update per frame is enough
+						}
 					}
-				}
+				});
 			});
 			ro.observe(canvas.parentElement);
 			containerWidth = canvas.parentElement.clientWidth;
@@ -478,6 +495,12 @@
 			dprMql.removeEventListener("change", dprMqlHandler);
 			dprMql = null;
 			dprMqlHandler = null;
+		}
+		// Cancel any pending resize rAF so it can't fire post-unmount and write to a
+		// stale `containerWidth` (which would re-run the geometry $effect on a dead canvas).
+		if (resizeRaf !== null) {
+			cancelAnimationFrame(resizeRaf);
+			resizeRaf = null;
 		}
 	});
 
