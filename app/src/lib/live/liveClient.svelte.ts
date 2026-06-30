@@ -22,9 +22,7 @@ import type { CompletionRequest, CompletionResult } from "$conductors/contract";
 
 let socket: WebSocket | null = null;
 let manualClose = false;
-// True once budget has been set from pi's contextWindow for the current connection.
-// Prevents subsequent syncs from overriding a user's manual budget adjustment.
-let budgetLive = false;
+// Budget is fixed at default (70k) — never overridden from contextWindow.
 
 /**
  * Safety backstop: if the extension (or the model it calls) never replies to a
@@ -232,15 +230,14 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 			// stick when attaching after viewing a Claude Code transcript, regardless of
 			// which caller reached connectLive.
 			session.readOnly = false;
-			// Safety (review Q5b): every new live attach starts DISARMED - folding is
-			// opt-in per session, never silently carried from a previously armed agent.
-			folding.enabled = false;
+			// Safety (review Q5b): every new live attach starts ARMED - folding is
+			// on by default per this fork, as the user prefers.
+			folding.enabled = true;
 			// Structural reset: clear all ghosts — no ghost survives a session reconnect.
 			ghostClearAll();
-			budgetLive = false;
 			session.store?.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
 			session.store = new AccordionStore({
-				meta: { format: "pi", title: msg.meta.title || "live pi session", cwd: msg.meta.cwd || "", model: msg.meta.model || "" },
+				meta: { format: "pi", title: msg.meta.title || "live pi session", cwd: msg.meta.cwd || "", model: msg.meta.model || "", sessionId: typeof msg.sessionId === "string" ? msg.sessionId : undefined },
 				blocks: [],
 				lineCount: 0,
 				skipped: 0,
@@ -252,8 +249,7 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 			session.store.wireAttached = true; // live wire up → view mirrors the wire (issue #13)
 			if (typeof msg.meta.contextWindow === "number" && msg.meta.contextWindow > 0) {
 				session.store.setContextWindow(msg.meta.contextWindow);
-				session.store.setBudget(msg.meta.contextWindow);
-				budgetLive = true;
+				// Budget stays at default (70k). Don't override with contextWindow.
 			}
 		} else if (msg.type === "sync") {
 			if (!session.store) return;
@@ -280,17 +276,11 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 				session.store.wireAttached = true; // socket still live after structural reset (issue #13)
 			}
 			// Update contextWindow from the sync (refreshed each context hook, and pushed
-			// immediately on a `/model` swap). Snap the budget to the window the FIRST time
-			// we learn it (before the user can adjust) AND whenever the window CHANGES — a
-			// changed window means a different model, so the old budget no longer fits.
+			// immediately on a `/model` swap). Budget stays at default (70k) — don't
+			// override with contextWindow.
 			const cw = msg.contextWindow;
 			if (typeof cw === "number" && cw > 0) {
-				const prev = session.store.contextWindow;
 				session.store.setContextWindow(cw);
-				if (!budgetLive || (prev !== null && prev !== cw)) {
-					session.store.setBudget(cw);
-					budgetLive = true;
-				}
 			}
 			// Committed blocks arrive HERE (the appendBlocks path), NEVER from ghost state.
 			// Invariant: a ghost is only removed, never converted to a block.
@@ -431,7 +421,6 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 
 export function disconnectLive(): void {
 	manualClose = true;
-	budgetLive = false;
 	// Guaranteed teardown (invariant #2): explicit disconnect clears all ghosts
 	// immediately, before the socket close fires.
 	ghostClearAll();

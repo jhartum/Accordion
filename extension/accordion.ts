@@ -493,7 +493,12 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			// any other origin because we set no CORS headers.
 			if (u.pathname === "/__accordion/meta") {
 				res.writeHead(200, { "Content-Type": "application/json" });
-				res.end(JSON.stringify({ served: true, sessionId, protocolVersion: PROTOCOL_VERSION }));
+				res.end(JSON.stringify({
+					served: true,
+					sessionId,
+					protocolVersion: PROTOCOL_VERSION,
+					thermoHost: process.env.ACCORDION_THERMO_HOST || null,
+				}));
 				return;
 			}
 
@@ -614,6 +619,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		}
 		wss.on("connection", (ws: WebSocket) => {
 			flushPending(); // supersede any prior GUI: its in-flight requests pass through
+			client?.close(); // close old GUI so it sees onclose, not a silent zombie
 			client = ws;
 			epoch++;
 			sentCount = 0; // re-sync the whole context to the freshly-connected GUI

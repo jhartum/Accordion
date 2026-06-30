@@ -27,7 +27,8 @@
 	const needed = $derived(computeNeededStats(store?.decisionJournal ?? [], currentTurn));
 	const verdict = $derived(health ? computeHealthVerdict(diagnostics.unitTrace ?? [], health, needed) : null);
 	const withinBudget = $derived((health?.assembledTokens ?? 0) <= (health?.budgetTokens ?? Number.POSITIVE_INFINITY));
-	const stale = $derived(!!requestedId && live.sessionId !== requestedId);
+	const activeSessionId = $derived(live.sessionId || store?.meta.sessionId || null);
+	const stale = $derived(!!requestedId && activeSessionId !== requestedId);
 	const unitRows = $derived(
 		[...(diagnostics.unitTrace ?? [])].sort((a, b) => (b.level ?? 0) - (a.level ?? 0) || (a.score ?? 0) - (b.score ?? 0)),
 	);
@@ -58,7 +59,7 @@
 		<div class="head-meta">
 			<span class="status {live.status}"></span>
 			<span>{live.status}</span>
-			{#if live.sessionId}<span class="mono">{live.sessionId.slice(0, 10)}</span>{/if}
+			{#if activeSessionId}<span class="mono">{activeSessionId.slice(0, 10)}</span>{/if}
 		</div>
 	</header>
 
@@ -71,9 +72,9 @@
 	{:else if stale}
 		<div class="warning">
 			This dashboard URL is for <span class="mono">{requestedId}</span>, but the active session is
-			<span class="mono">{live.sessionId ?? "none"}</span>.
+			<span class="mono">{activeSessionId ?? "none"}</span>.
 		</div>
-		<a class="dash-link" href={live.sessionId ? `/conductor/${encodeURIComponent(live.sessionId)}` : "/conductor"}>Open active dashboard</a>
+		<a class="dash-link" href={activeSessionId ? `/conductor/${encodeURIComponent(activeSessionId)}` : "/conductor"}>Open active dashboard</a>
 	{:else}
 		<section class="summary-grid">
 			<div class="summary-card verdict {verdict?.level ?? 'green'}">

@@ -250,8 +250,6 @@ var FOCUS_PATH = path.join(REGISTRY_ROOT, FOCUS_FILE);
 var ACCORDION_APP_FLAG = "accordion-app";
 var ACCORDION_APP_ENV = "ACCORDION_APP_PATH";
 var ACCORDION_PORT_ENV = "ACCORDION_PORT";
-var ACCORDION_HOST_ENV = "ACCORDION_HOST";
-var HOST = process.env[ACCORDION_HOST_ENV] || "0.0.0.0";
 function cleanExplicitPath(value) {
   if (typeof value !== "string") return null;
   let s = value.trim();
@@ -540,7 +538,12 @@ function accordionLive(pi) {
       const u = new URL(req.url || "/", "http://127.0.0.1");
       if (u.pathname === "/__accordion/meta") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ served: true, sessionId, protocolVersion: PROTOCOL_VERSION }));
+        res.end(JSON.stringify({
+          served: true,
+          sessionId,
+          protocolVersion: PROTOCOL_VERSION,
+          thermoHost: process.env.ACCORDION_THERMO_HOST || null
+        }));
         return;
       }
       if (!isWebAuthed(req, u)) {
@@ -616,7 +619,7 @@ function accordionLive(pi) {
         wss = null;
       });
       const bindPort = parseInt(process.env[ACCORDION_PORT_ENV], 10) || 0;
-      httpServer.listen(bindPort, HOST, () => {
+      httpServer.listen(bindPort, "0.0.0.0", () => {
         const addr = httpServer?.address();
         if (addr && typeof addr === "object") {
           port = addr.port;
@@ -638,6 +641,7 @@ function accordionLive(pi) {
     }
     wss.on("connection", (ws) => {
       flushPending();
+      client?.close();
       client = ws;
       epoch++;
       sentCount = 0;
@@ -952,7 +956,7 @@ function accordionLive(pi) {
         action.text,
         `Live link: ${wasAttached ? "attached" : "detached"} \xB7 port ${port || "starting"} \xB7 streamed ${sentCount} blocks`
       ];
-      if (port && webToken) lines.push(`Browser: http://${HOST}:${port}/?token=${webToken}`);
+      if (port && webToken) lines.push(`Browser: http://127.0.0.1:${port}/?token=${webToken}`);
       else lines.push("Browser: starting\u2026");
       ctx.ui.notify(lines.join("\n"), action.type);
     }

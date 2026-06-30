@@ -5,8 +5,8 @@
 	import { connectLive, disconnectLive, live } from "$lib/live/liveClient.svelte";
 	import { discovery, startDiscovery, stopDiscovery, DEMO_ID } from "$lib/live/discovery.svelte";
 	import { claudeDiscovery, startClaudeDiscovery, stopClaudeDiscovery } from "$lib/live/claudeDiscovery.svelte";
-	import { conductorState } from "$lib/live/conductor.svelte";
-	import { startConductorDiscovery, stopConductorDiscovery, allConductors, isLaunching } from "$lib/live/conductorDiscovery.svelte";
+	import { conductorState, setDefaultConductorId } from "$lib/live/conductor.svelte";
+	import { startConductorDiscovery, stopConductorDiscovery, allConductors, isLaunching, ensureThermoclineConfigured } from "$lib/live/conductorDiscovery.svelte";
 	import { attachConductor, conductorRetry } from "$lib/live/conductorClient.svelte";
 	import { folding } from "$lib/live/folding.svelte";
 	import { foldAlarm, runFoldCheck } from "$lib/live/foldAlarm.svelte";
@@ -162,6 +162,13 @@
 		startDiscovery(onFocusRequest);
 		startConductorDiscovery();
 
+		// Auto-configure thermocline. In browser-served mode this uses the current
+		// page host (TAILSCALE_IP/MagicDNS/localhost) and port 7703. Optional override:
+		// ACCORDION_THERMO_HOST.
+		ensureThermoclineConfigured().then((host) => {
+			setDefaultConductorId(host);
+		});
+
 		// Browser-served auto-connect: if this page was served by the pi extension on a
 		// loopback port, /__accordion/meta returns { served: true, sessionId, protocolVersion }.
 		// In any other context (Vite dev server, static host) the endpoint is absent — 404 or
@@ -173,10 +180,14 @@
 					if (!res.ok) return;
 					const ct = res.headers.get("content-type") ?? "";
 					if (!ct.includes("application/json")) return;
-					const body = await res.json() as { served?: boolean; sessionId?: string; protocolVersion?: number };
+					const body = await res.json() as { served?: boolean; sessionId?: string; protocolVersion?: number; thermoHost?: string | null };
 					if (body.served !== true) return;
 					browserServed = true;
 					servedSessionId = body.sessionId ?? null;
+					if (body.thermoHost) {
+						const host = await ensureThermoclineConfigured(body.thermoHost);
+						setDefaultConductorId(host);
+					}
 					const port = Number(window.location.port) || DEFAULT_PORT;
 					connectLive(port);
 				} catch {

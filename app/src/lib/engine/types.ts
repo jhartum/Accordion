@@ -114,6 +114,7 @@ export interface SessionMeta {
 	title: string;
 	cwd: string;
 	model: string;
+	sessionId?: string;
 }
 
 export interface ParsedSession {
