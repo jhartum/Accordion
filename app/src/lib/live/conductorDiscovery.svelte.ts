@@ -216,6 +216,26 @@ export function stopConductorDiscovery(): void {
 
 // ─── configured (hand-entered) conductors ──────────────────────────────────────
 
+/** Well-known id prefix for thermocline (user's preferred external conductor). */
+export const THERMO_PORT = 7703;
+
+/** Build the thermocline WebSocket URL from a host. */
+export function thermoclineUrl(host: string): string {
+	const trimmed = host.trim().replace(/\/+$/, "");
+	if (/^wss?:\/\//i.test(trimmed)) return trimmed;
+	return `ws://${trimmed}:${THERMO_PORT}`;
+}
+
+/** Stable configured id for thermocline at a given host. */
+export function thermoclineConfiguredId(host: string): string {
+	return `cfg:${thermoclineUrl(host)}`;
+}
+
+/** True if the given id matches a thermocline configured entry. */
+export function isThermoclineId(id: string): boolean {
+	return id.startsWith("cfg:ws://") && id.endsWith(`:${THERMO_PORT}`);
+}
+
 /** A stable id for a configured URL so selection survives reloads. */
 function configuredId(url: string): string {
 	return `cfg:${url}`;
@@ -258,6 +278,42 @@ function persistConfigured(): void {
 	} catch {
 		/* storage full / blocked — configured conductors just won't persist */
 	}
+}
+
+/**
+ * Ensure the thermocline conductor is configured (if THERMO_HOST is set).
+ * Returns the host string if found, or null if not set.
+ * Safe to call multiple times — no-ops if already configured.
+ */
+export async function ensureThermoclineConfigured(hostOverride?: string | null): Promise<string | null> {
+	// Prefer explicit host from extension meta/current page, else optional Accordion-specific
+	// override. Do NOT use THERMO_HOST: thermocline itself may use it as a bind host (0.0.0.0),
+	// which is not a valid browser client target.
+	let host: string | null = hostOverride?.trim() || null;
+	if (!host) {
+		try {
+			const { invoke } = await import("@tauri-apps/api/core");
+			const val = await invoke<string | null>("read_env_var", { name: "ACCORDION_THERMO_HOST" });
+			if (val && val.trim()) host = val.trim();
+		} catch {
+			/* not Tauri — try browser/VITE fallbacks */
+		}
+	}
+	if (!host && typeof window !== "undefined" && window.location.hostname) {
+		host = window.location.hostname;
+	}
+	if (!host && typeof import.meta !== "undefined" && import.meta.env?.VITE_ACCORDION_THERMO_HOST) {
+		host = String(import.meta.env.VITE_ACCORDION_THERMO_HOST).trim() || null;
+	}
+	if (!host || host === "0.0.0.0") return null;
+
+	const url = thermoclineUrl(host);
+	const id = thermoclineConfiguredId(host);
+	// Already configured? Skip.
+	if (conductorDiscovery.configured.some((c) => c.id === id)) return host;
+
+	addConfiguredConductor(url, host);
+	return host;
 }
 
 function loadConfigured(): ConductorEntry[] {

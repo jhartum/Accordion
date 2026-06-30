@@ -29,6 +29,7 @@
 		stopConductor,
 		isLaunching,
 		launchFailures,
+		isThermoclineId,
 	} from "$lib/live/conductorDiscovery.svelte";
 	import { mergeExternalConductors, type ExternalRow } from "$lib/live/conductorMerge";
 	import { isTauriEnv } from "$lib/session.svelte";
@@ -113,6 +114,8 @@
 		if (!cond || pendingConsent) return;
 		if (inProcessConductor(cond.id)) return;
 		if (!isExclusive(locks)) return;
+		// Auto-consent for thermocline (user opted in via THERMO_HOST env var).
+		if (isThermoclineId(cond.id)) return;
 		if (remoteConsentedIds.has(cond.id)) return;
 
 		// Remote exclusive conductor not yet consented — show the post-handshake gate.

@@ -38,7 +38,8 @@ import { scoreCandidates, tailTextFromView } from "./scorer.mjs";
 const ID = "thermocline";
 const LABEL = "Thermocline";
 const PORT = Number(process.env.THERMO_PORT || 7703);
-const URL = `ws://127.0.0.1:${PORT}`;
+const HOST = process.env.THERMO_HOST || "127.0.0.1";
+const URL = `ws://${HOST === "0.0.0.0" ? "127.0.0.1" : HOST}:${PORT}`;
 
 // `node thermocline.mjs --smoke` runs the inline smoke harness instead of the WS server (it must
 // NOT bind a port or advertise a heartbeat). See the bottom of the file.
@@ -1271,7 +1272,7 @@ async function runSmoke() {
 
 if (!SMOKE) {
 	const { WebSocketServer } = await import("ws");
-	const wss = new WebSocketServer({ host: "127.0.0.1", port: PORT });
+	const wss = new WebSocketServer({ host: HOST, port: PORT });
 	wss.on("connection", onConnection);
 	log(`${LABEL} listening on ${URL}`);
 	log(`waters: warm=${(CFG.warmWater * 100).toFixed(0)}% high=${(CFG.highWater * 100).toFixed(0)}% low=${(CFG.lowWater * 100).toFixed(0)}%  advertised at ${REG_FILE}`);
