@@ -240,7 +240,7 @@ var FOCUS_FILE = "focus.json";
 var HEARTBEAT_INTERVAL_MS = 5e3;
 
 // accordion.ts
-var REQUEST_TIMEOUT_MS = 250;
+var REQUEST_TIMEOUT_MS = Math.max(250, parseInt(process.env.ACCORDION_PLAN_TIMEOUT_MS || "2000", 10) || 2e3);
 var UNFOLD_TIMEOUT_MS = 2e3;
 var RECALL_TIMEOUT_MS = 2e3;
 var HOME = process.env.ACCORDION_HOME || os.homedir();
@@ -366,7 +366,9 @@ function accordionLive(pi) {
   let client = null;
   let sessionId = "";
   let meta = { title: "pi session", cwd: "", model: "", contextWindow: null, format: "pi" };
-  let sentCount = 0;
+  let viewSentCount = 0;
+  let planSentCount = 0;
+  let lastAppliedPlanHadFolds = false;
   let reqSeq = 0;
   let epoch = 0;
   const pending = /* @__PURE__ */ new Map();
@@ -644,7 +646,9 @@ function accordionLive(pi) {
       client?.close();
       client = ws;
       epoch++;
-      sentCount = 0;
+      viewSentCount = 0;
+      planSentCount = 0;
+      lastAppliedPlanHadFolds = false;
       reqSeq = 0;
       send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, meta });
       const live = readSessionMessages(latestCtx);
@@ -652,7 +656,7 @@ function accordionLive(pi) {
       const backlog = linearize(lastMessages);
       if (backlog.length) {
         send(ws, { type: "sync", reqId: ++reqSeq, full: true, blocks: backlog, contextWindow });
-        sentCount = backlog.length;
+        viewSentCount = backlog.length;
       }
       ws.on("message", (data) => {
         if (ws !== client) return;
@@ -818,7 +822,9 @@ function accordionLive(pi) {
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
     sessionId = `s-${process.pid}-${Date.now()}`;
-    sentCount = 0;
+    viewSentCount = 0;
+    planSentCount = 0;
+    lastAppliedPlanHadFolds = false;
     pendingSince = [];
     lastMessages = readSessionMessages(ctx);
     startedAt = Date.now();
@@ -864,14 +870,16 @@ function accordionLive(pi) {
     pendingSince = [];
     const all = linearize(lastMessages);
     if (!attached()) return;
-    const fresh = all.slice(sentCount);
+    const full = viewSentCount === 0 || viewSentCount > all.length;
+    const blocks = full ? all : all.slice(viewSentCount);
     const reqId = ++reqSeq;
-    const full = sentCount === 0;
-    const plan = await requestPlan(reqId, full, fresh);
+    const plan = await requestPlan(reqId, full, blocks);
     if (plan === null) return;
     if (epoch !== myEpoch) return;
-    sentCount = Math.max(sentCount, all.length);
-    if (plan.ops.length === 0 && plan.groups.length === 0) return;
+    planSentCount = Math.max(planSentCount, all.length);
+    viewSentCount = Math.max(viewSentCount, all.length);
+    lastAppliedPlanHadFolds = plan.ops.length > 0 || plan.groups.length > 0;
+    if (!lastAppliedPlanHadFolds) return;
     return { messages: applyPlan(event.messages, plan.ops, plan.groups) };
   });
   pi.on("model_select", (event) => {
@@ -892,11 +900,11 @@ function accordionLive(pi) {
     const alreadySeen = [...msgIds].some((id) => baseIds.has(id) || pendIds.has(id));
     if (msgIds.size > 0 && !alreadySeen) pendingSince.push(msg);
     const all = linearize([...lastMessages, ...pendingSince]);
-    if (all.length <= sentCount) return;
+    if (all.length <= viewSentCount) return;
     const reqId = ++reqSeq;
-    const full = sentCount === 0;
-    send(ws, { type: "sync", reqId, full, blocks: all.slice(sentCount) });
-    sentCount = all.length;
+    const full = viewSentCount === 0;
+    send(ws, { type: "sync", reqId, full, blocks: all.slice(viewSentCount) });
+    viewSentCount = all.length;
   });
   pi.on("agent_end", (event, ctx) => {
     latestCtx = ctx;
@@ -906,16 +914,16 @@ function accordionLive(pi) {
     if (!ws || ws.readyState !== 1) return;
     sendStream({ type: "stream", phase: "abort", kind: "text", contentIndex: -1 });
     const all = linearize(lastMessages);
-    if (all.length <= sentCount) return;
+    if (all.length <= viewSentCount) return;
     const reqId = ++reqSeq;
-    const full = sentCount === 0;
-    send(ws, { type: "sync", reqId, full, blocks: all.slice(sentCount) });
-    sentCount = all.length;
+    const full = viewSentCount === 0;
+    send(ws, { type: "sync", reqId, full, blocks: all.slice(viewSentCount) });
+    viewSentCount = all.length;
   });
   pi.on("session_before_compact", (_event, ctx) => {
-    if (attached()) {
+    if (attached() && lastAppliedPlanHadFolds && planSentCount > 0) {
       try {
-        ctx.ui.notify("Accordion attached \u2014 native compaction suppressed.", "info");
+        ctx.ui.notify("Accordion is actively folding context \u2014 native compaction suppressed.", "info");
       } catch {
       }
       return { cancel: true };
@@ -954,7 +962,7 @@ function accordionLive(pi) {
       const action = launchResultLine(launch);
       const lines = [
         action.text,
-        `Live link: ${wasAttached ? "attached" : "detached"} \xB7 port ${port || "starting"} \xB7 streamed ${sentCount} blocks`
+        `Live link: ${wasAttached ? "attached" : "detached"} \xB7 port ${port || "starting"} \xB7 streamed ${viewSentCount} blocks`
       ];
       if (port && webToken) lines.push(`Browser: http://127.0.0.1:${port}/?token=${webToken}`);
       else lines.push("Browser: starting\u2026");
