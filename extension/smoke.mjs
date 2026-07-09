@@ -969,6 +969,18 @@ if (!recallTool) {
 // dependent and lives in smoke-config.mjs (spawned children). Here we drive the
 // `context`/`message_end` hooks through a fresh GUI whose reply behavior we switch
 // per scenario: reply-with-fold, reply-with-empty, or withhold (force timeout).
+
+// Mirrors pi's real `message_end` contract (MessageEndEventResult, see
+// node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/types.d.ts): the
+// runner's emitMessageEnd does `if (!handlerResult?.message) continue;` — a handler's
+// return only takes effect wrapped as `{ message }`; a bare message is silently
+// dropped. Applying that same gate to the raw handler return (rather than reading
+// `.usage` straight off it) is what makes rttVal below actually depend on the
+// extension returning the correct `{ message }` shape.
+function unwrapMessageEnd(result) {
+	if (!result?.message) return undefined;
+	return result.message;
+}
 const stale = { primedFold: null, staleFold: null, emptyPass: undefined, afterEmptyPass: undefined, rtt: null, rtt2: null };
 {
 	const gui = new WebSocket(`ws://127.0.0.1:${PORT}`);
@@ -1025,12 +1037,16 @@ if (stale.emptyPass !== undefined) fails.push("stale-fallback: delivered empty p
 if (stale.afterEmptyPass !== undefined)
 	fails.push("stale-fallback: a timeout after a delivered EMPTY plan wrongly resurrected the older non-empty plan");
 // Feature C: rttMs stamped on the assistant message following a context wait.
-const rttVal = stale.rtt?.usage?.rttMs;
+// Unwrapped via the runner's `{ message }` contract (see unwrapMessageEnd above) — a
+// regression to the pre-fix bare-message return makes this undefined, failing the test.
+const rttMessage = unwrapMessageEnd(stale.rtt);
+const rttVal = rttMessage?.usage?.rttMs;
 if (!(typeof rttVal === "number" && Number.isInteger(rttVal) && rttVal >= 0))
 	fails.push(`rttMs: assistant message_end did not carry an integer usage.rttMs (got ${JSON.stringify(rttVal)})`);
-if (stale.rtt?.role !== "assistant") fails.push("rttMs: injected message must keep role assistant");
+if (rttMessage?.role !== "assistant") fails.push("rttMs: injected message must keep role assistant");
 // Feature C: no preceding context wait → the stash was cleared → no rttMs field leaks.
-if (stale.rtt2 && stale.rtt2.usage && typeof stale.rtt2.usage.rttMs === "number")
+const rtt2Message = unwrapMessageEnd(stale.rtt2);
+if (rtt2Message && rtt2Message.usage && typeof rtt2Message.usage.rttMs === "number")
 	fails.push("rttMs: a message with no preceding context RTT wrongly received a rttMs field (stale stash leaked)");
 
 // ── assertions ───────────────────────────────────────────────────────────────

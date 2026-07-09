@@ -81,10 +81,12 @@ must enforce a hard context budget.
 | Env var | Default | Effect |
 |---|---|---|
 | `ACCORDION_PLAN_TIMEOUT_MS` | `250` | How long a model request waits for the GUI's fold plan before falling back. On a miss the extension re-applies the **last known plan** rather than shipping the conversation unfolded (a one-turn-stale plan is strictly better than none), and logs the fallback — it is never silent. |
-| `ACCORDION_STEERING` | off | Truthy (`1`/`true`) switches the wait to a hard **deadline** (`ACCORDION_PLAN_DEADLINE_MS`) instead of the short timeout, so a run whose cap must hold actually holds it. A missed deadline is logged loudly and still falls back to the last known plan. It never blocks when no GUI is attached, and a mid-wait disconnect resolves immediately. |
+| `ACCORDION_STEERING` | off | Truthy (`1`/`true`) switches the wait to a hard **deadline** (`ACCORDION_PLAN_DEADLINE_MS`) instead of the short timeout, so a run whose cap must hold actually holds it. A missed deadline is logged loudly and still falls back to the last known plan. It never blocks when no GUI is attached, and a mid-wait disconnect resolves immediately. **Caution:** a hung-but-connected GUI (socket open, not replying) stalls *every* model request by the full deadline (10s by default) — there is deliberately no circuit breaker yet; a consecutive-miss breaker is tracked as follow-up work. |
 | `ACCORDION_PLAN_DEADLINE_MS` | `10000` | Steering-mode deadline. Ignored unless `ACCORDION_STEERING` is on. |
 
-Invalid values (non-numeric, `NaN`, `≤0`) fall back to the default.
+Invalid values (non-numeric, `NaN`, `≤0`, or non-integer such as `"250.5"`) fall back to
+the default. Values are parsed with `Number()`, so scientific notation (`"1e3"`) and hex
+(`"0x10"`) are also accepted as long as they resolve to a positive integer.
 
 Each request also records the plan round-trip time it waited, stamped onto the assistant
 message it produced as `usage.rttMs` (integer milliseconds) in the session file.
