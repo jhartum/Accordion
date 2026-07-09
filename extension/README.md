@@ -72,6 +72,23 @@ reasons over at full fidelity.
 <img src="https://raw.githubusercontent.com/a-Fig/Accordion/main/docs/assets/attention-conductor.png" alt="Attention conductor view — each block tinted by how much the working tail still attends back to it" width="600">
 </div>
 
+## Configuration
+
+Advanced knobs, read from the environment once when the extension loads. Defaults are
+tuned for interactive use; the steering knobs matter mainly for benchmark harnesses that
+must enforce a hard context budget.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `ACCORDION_PLAN_TIMEOUT_MS` | `250` | How long a model request waits for the GUI's fold plan before falling back. On a miss the extension re-applies the **last known plan** rather than shipping the conversation unfolded (a one-turn-stale plan is strictly better than none), and logs the fallback — it is never silent. |
+| `ACCORDION_STEERING` | off | Truthy (`1`/`true`) switches the wait to a hard **deadline** (`ACCORDION_PLAN_DEADLINE_MS`) instead of the short timeout, so a run whose cap must hold actually holds it. A missed deadline is logged loudly and still falls back to the last known plan. It never blocks when no GUI is attached, and a mid-wait disconnect resolves immediately. |
+| `ACCORDION_PLAN_DEADLINE_MS` | `10000` | Steering-mode deadline. Ignored unless `ACCORDION_STEERING` is on. |
+
+Invalid values (non-numeric, `NaN`, `≤0`) fall back to the default.
+
+Each request also records the plan round-trip time it waited, stamped onto the assistant
+message it produced as `usage.rttMs` (integer milliseconds) in the session file.
+
 ## Skills included
 
 This package registers two pi skills the agent uses to interact with folded context:

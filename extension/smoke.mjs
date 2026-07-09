@@ -963,6 +963,76 @@ if (!recallTool) {
 	await new Promise((resolve) => { wsr.on("close", resolve); wsr.close(); });
 }
 
+// ── issue #58: stale-plan fallback + empty-plan cache + rttMs stamp ───────────
+// Feature A (stale-plan fallback) and Feature C (rttMs) run against the DEFAULT env
+// (250ms timeout). Feature B (steering deadline + env parsing) is module-init env
+// dependent and lives in smoke-config.mjs (spawned children). Here we drive the
+// `context`/`message_end` hooks through a fresh GUI whose reply behavior we switch
+// per scenario: reply-with-fold, reply-with-empty, or withhold (force timeout).
+const stale = { primedFold: null, staleFold: null, emptyPass: undefined, afterEmptyPass: undefined, rtt: null, rtt2: null };
+{
+	const gui = new WebSocket(`ws://127.0.0.1:${PORT}`);
+	let mode = "ignore"; // "fold" | "empty" | "drop" | "ignore"
+	gui.on("message", (data) => {
+		let m;
+		try { m = JSON.parse(data.toString()); } catch { return; }
+		if (m.type !== "sync") return;
+		if (mode === "fold") gui.send(JSON.stringify({ type: "plan", reqId: m.reqId, ops: [{ id: "a:resp-abc:p0", digestText: "STALEFOLD" }], groups: [] }));
+		else if (mode === "empty") gui.send(JSON.stringify({ type: "plan", reqId: m.reqId, ops: [], groups: [] }));
+		// "drop"/"ignore" → deliberately no reply (the attach flush is an "ignore" sync)
+	});
+	await new Promise((res, rej) => { gui.on("open", res); gui.on("error", rej); });
+	await new Promise((r) => setTimeout(r, 100)); // let the view-only attach flush settle
+
+	// 1) Prime the cache: the GUI delivers a NON-EMPTY plan → lastPlan cached + applied.
+	mode = "fold";
+	stale.primedFold = await Promise.resolve(handlers.context({ messages: sample }, ctx));
+
+	// 2) TIMEOUT → the extension must re-apply the LAST KNOWN plan, not pass through
+	//    unfolded. The GUI withholds its reply; after the 250ms default wait the
+	//    context hook falls back to the cached STALEFOLD plan.
+	mode = "drop";
+	stale.staleFold = await Promise.resolve(handlers.context({ messages: sample }, ctx));
+
+	// 3) A delivered EMPTY plan (conductor wants no folds) must REPLACE the cached
+	//    non-empty plan — a later timeout must then pass through unfolded, never
+	//    resurrect the old fold.
+	mode = "empty";
+	stale.emptyPass = await Promise.resolve(handlers.context({ messages: sample }, ctx));
+	mode = "drop";
+	stale.afterEmptyPass = await Promise.resolve(handlers.context({ messages: sample }, ctx));
+
+	// 4) rttMs stamp: a context wait stashes an RTT that the NEXT assistant message_end
+	//    stamps onto usage.rttMs; a following assistant message with no preceding context
+	//    wait gets NO field (the stash was consumed+cleared).
+	mode = "fold";
+	await Promise.resolve(handlers.context({ messages: sample }, ctx)); // stashes an RTT
+	stale.rtt = await Promise.resolve(handlers.message_end({ message: { role: "assistant", content: [{ type: "text", text: "RTT REPLY" }], responseId: "resp-rtt", timestamp: T0 + 5000 } }, ctx));
+	stale.rtt2 = await Promise.resolve(handlers.message_end({ message: { role: "assistant", content: [{ type: "text", text: "SECOND REPLY" }], responseId: "resp-rtt2", timestamp: T0 + 5001 } }, ctx));
+
+	gui.close();
+	await new Promise((r) => setTimeout(r, 50));
+}
+// Feature A: primed non-empty plan applied (resp-abc → STALEFOLD).
+if (stale.primedFold?.messages?.[1]?.content?.[0]?.text !== "STALEFOLD")
+	fails.push(`stale-fallback: primed plan did not fold resp-abc (got ${JSON.stringify(stale.primedFold?.messages?.[1]?.content?.[0]?.text)})`);
+// Feature A: on timeout the STALE plan is re-applied instead of passthrough.
+if (!stale.staleFold?.messages) fails.push("stale-fallback: timeout passed through unfolded instead of applying the last known plan");
+else if (stale.staleFold.messages[1]?.content?.[0]?.text !== "STALEFOLD")
+	fails.push(`stale-fallback: timeout did not re-apply the cached fold (got ${JSON.stringify(stale.staleFold.messages[1]?.content?.[0]?.text)})`);
+// Feature A: a delivered empty plan passes through AND is cached (not overridden by the older plan).
+if (stale.emptyPass !== undefined) fails.push("stale-fallback: delivered empty plan did not pass through");
+if (stale.afterEmptyPass !== undefined)
+	fails.push("stale-fallback: a timeout after a delivered EMPTY plan wrongly resurrected the older non-empty plan");
+// Feature C: rttMs stamped on the assistant message following a context wait.
+const rttVal = stale.rtt?.usage?.rttMs;
+if (!(typeof rttVal === "number" && Number.isInteger(rttVal) && rttVal >= 0))
+	fails.push(`rttMs: assistant message_end did not carry an integer usage.rttMs (got ${JSON.stringify(rttVal)})`);
+if (stale.rtt?.role !== "assistant") fails.push("rttMs: injected message must keep role assistant");
+// Feature C: no preceding context wait → the stash was cleared → no rttMs field leaks.
+if (stale.rtt2 && stale.rtt2.usage && typeof stale.rtt2.usage.rttMs === "number")
+	fails.push("rttMs: a message with no preceding context RTT wrongly received a rttMs field (stale stash leaked)");
+
 // ── assertions ───────────────────────────────────────────────────────────────
 if (!seen.hello) fails.push("never received hello");
 if (!seen.flushOnAttach) fails.push("GUI received no history flush on attach (would stay empty until first message — the bug)");
@@ -1011,6 +1081,7 @@ console.log(
 			`resumed-session attach-flush ✓  getBranch fallback ✓  ` +
 				`anchor-less positional-id round-trip ✓  applyPlan guard (positional + empty-digest refused) ✓  ` +
 					`unfold tool (no-ids / detached guards, attached round-trip) ✓  ` +
-					`recall tool (no-ids / detached guards, content-echo round-trip) ✓  skill discovery ✓`,
+					`recall tool (no-ids / detached guards, content-echo round-trip) ✓  skill discovery ✓  ` +
+					`stale-plan fallback (timeout re-applies last plan, empty plan not overridden) ✓  rttMs stamp ✓`,
 );
 process.exit(0);
