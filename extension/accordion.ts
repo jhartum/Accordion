@@ -16,12 +16,38 @@
  * becoming duplicate windows).
  *
  * Safety:
- *   • No GUI connected, or the plan reply times out → pass messages through
- *     UNMODIFIED. We never corrupt context.
+ *   • No GUI connected → pass messages through UNMODIFIED. We never corrupt context.
+ *   • The plan reply times out → apply the LAST KNOWN plan instead of silently
+ *     passing through unfolded (issue #58: a stale one-turn plan is strictly better
+ *     than shipping the whole conversation past budget). If there is no cached plan
+ *     yet, pass through as before — but always log the timeout (never silent). Note:
+ *     on a timeout-with-stale-fallback turn, what the GUI is showing can diverge for
+ *     that one turn from what the extension actually sent the model (the stale plan
+ *     may be missing folds/unfolds the GUI has since queued) — the fold alarm has no
+ *     visibility into this, since it never receives the applied plan back. The next
+ *     plan the GUI delivers resyncs both sides.
  *   • pi's native /compact is suppressed ONLY while the GUI is attached.
  *   • The shared mapping (linearize/applyPlan) carries the provider-safety rules
  *     (durable-id + kind checks); the engine is the single foldability gate and
  *     never folds a protected block, so no wire-side position backstop is needed.
+ *
+ * Env configuration (read once at module init):
+ *   • ACCORDION_PLAN_TIMEOUT_MS  — how long a `context` hook waits on the GUI's plan
+ *     before falling back (positive int, default 250).
+ *   • ACCORDION_STEERING         — truthy ("1"/"true", case-insensitive) switches the
+ *     plan wait to a hard DEADLINE (ACCORDION_PLAN_DEADLINE_MS) instead of the short
+ *     timeout, so a benchmark harness actually enforces its cap. A missed deadline is
+ *     logged loudly and still falls back to the last known plan (or passthrough). It
+ *     never blocks when no GUI is attached, and a mid-wait disconnect resolves at once.
+ *   • ACCORDION_PLAN_DEADLINE_MS — steering-mode deadline (positive int, default 10000).
+ *   Parsed with `Number()`, then required to be a positive integer. Invalid values
+ *   (missing / NaN / ≤0 / non-integer, e.g. "250.5") fall back to the default. Note
+ *   `Number()` accepts more than plain decimal — scientific notation ("1e3") and hex
+ *   ("0x10") are both valid positive integers and will be honored, not rejected.
+ *
+ * Plan round-trip time (RTT): each `context` hook measures how long it waited on the
+ * plan and stamps it onto the assistant message it produced as `usage.rttMs` (integer
+ * ms), so downstream tooling can see per-request wait cost. See the `message_end` hook.
  *
  * Milestone 1: the GUI replies with an empty plan, so this never alters a model
  * call — it only proves the loop and powers the live view.
@@ -46,6 +72,17 @@ import { DEFAULT_PORT, PROTOCOL_VERSION, type FoldOp, type GroupOp, type ServerM
 
 /** The GUI's reply to a sync: in-place fold ops + group-collapse ops (ADR 0006). */
 type Plan = { ops: FoldOp[]; groups: GroupOp[] };
+/**
+ * Outcome of awaiting a plan (issue #58). The old code collapsed all three cases into
+ * a single `{ops:[],groups:[]}`/`null`, so a genuine empty plan (conductor wants no
+ * folds) was indistinguishable from a timeout (GUI too slow) — the timeout then passed
+ * through UNFOLDED and silently. This discriminates them:
+ *   • "plan"    — the GUI delivered a plan (possibly genuinely empty).
+ *   • "timeout" — the wait elapsed with no reply → fall back to the last known plan.
+ *   • "unsent"  — nothing was delivered (no GUI at call time, or the socket dropped /
+ *                 was superseded mid-wait via flushPending) → passthrough, don't advance.
+ */
+type PlanResult = { kind: "plan"; plan: Plan } | { kind: "timeout" } | { kind: "unsent" };
 import {
 	REGISTRY_PROTOCOL,
 	REGISTRY_DIR,
@@ -56,7 +93,33 @@ import {
 	type FocusRequest,
 } from "../app/src/lib/live/registry";
 
-const REQUEST_TIMEOUT_MS = 250; // how long pi waits on the GUI before passing through
+// Env-config helpers. Parse defensively: a positive integer only, anything else
+// (missing / non-numeric / NaN / ≤0 / non-integer) falls back to the default.
+function envPositiveInt(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (typeof raw !== "string") return fallback;
+	const n = Number(raw.trim());
+	return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+// Truthy env flag: "1" or "true" (case-insensitive). Everything else is false.
+function envTruthy(name: string): boolean {
+	const raw = process.env[name];
+	if (typeof raw !== "string") return false;
+	const v = raw.trim().toLowerCase();
+	return v === "1" || v === "true";
+}
+
+// How long a `context` hook waits on the GUI before falling back (issue #58). This
+// used to be a silent 250ms passthrough; it is now configurable and the fallback is
+// no longer silent (stale plan + log — see the `context` hook).
+const PLAN_TIMEOUT_MS = envPositiveInt("ACCORDION_PLAN_TIMEOUT_MS", 250);
+// Steering (blocking) mode: enforce the budget by waiting a hard DEADLINE for the plan
+// instead of the short timeout, so a benchmark run whose cap must hold actually holds it.
+const STEERING = envTruthy("ACCORDION_STEERING");
+const PLAN_DEADLINE_MS = envPositiveInt("ACCORDION_PLAN_DEADLINE_MS", 10_000);
+// The wait a `context` plan request actually uses: the long deadline under steering,
+// the short timeout otherwise. Either way a missed wait falls back (stale plan / passthrough).
+const PLAN_WAIT_MS = STEERING ? PLAN_DEADLINE_MS : PLAN_TIMEOUT_MS;
 // Unfold replies arrive during the agent's OWN turn (not on the model-call critical
 // path), so a generous wait is fine — the user's next message isn't blocked.
 const UNFOLD_TIMEOUT_MS = 2000;
@@ -223,7 +286,17 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	let sentCount = 0; // blocks already streamed to the current client
 	let reqSeq = 0;
 	let epoch = 0; // bumped on every new GUI connection; invalidates in-flight requests
-	const pending = new Map<number, (plan: Plan) => void>();
+	const pending = new Map<number, (r: PlanResult) => void>();
+	// Last plan the GUI DELIVERED (issue #58). Cached — including a genuinely empty plan
+	// (empty = "conductor wants no folds", so caching it prevents wrongly re-applying an
+	// older non-empty plan) — so a timed-out `context` can apply it instead of shipping the
+	// whole conversation unfolded. Reset wherever the cursor/epoch resets (session_start +
+	// GUI (re)connect): a plan from a superseded view must never apply to a fresh sync.
+	let lastPlan: Plan | null = null;
+	// Most recent plan round-trip time (ms), stashed by `context` and consumed by
+	// `message_end` to stamp `usage.rttMs` on the assistant message this request produced.
+	// null = no context RTT to attribute (e.g. no GUI attached this turn) → no field stamped.
+	let lastPlanRttMs: number | null = null;
 	// Unfold requests: keyed by reqId, resolved when the GUI replies (or null on flush).
 	// Deliberately NOT reset on reconnect (unlike reqSeq): a late reply from a superseded
 	// GUI can never alias a fresh request's reqId, and flushPending() drains the map anyway.
@@ -267,9 +340,13 @@ export default function accordionLive(pi: ExtensionAPI): void {
 
 	const attached = (): boolean => !!client && client.readyState === 1; /* OPEN */
 
-	/** Resolve every outstanding request as passthrough (used on connect-swap / shutdown). */
+	/** Resolve every outstanding request as passthrough (used on connect-swap / disconnect / shutdown). */
 	function flushPending(): void {
-		for (const resolve of pending.values()) resolve({ ops: [], groups: [] });
+		// "unsent": the GUI is gone (superseded / dropped / shutting down), so the in-flight
+		// `context` awaits pass through WITHOUT advancing the cursor — same meaning as before
+		// (an undeliverable request never alters or claims-as-sent a model call). Distinct from
+		// a timeout, which DID deliver blocks and falls back to the last known plan.
+		for (const resolve of pending.values()) resolve({ kind: "unsent" });
 		pending.clear();
 		// In-flight unfold requests (if any) must also be resolved. null signals "not
 		// attached" — the tool returns a safe "did not respond" message to the agent.
@@ -615,6 +692,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			epoch++;
 			sentCount = 0; // re-sync the whole context to the freshly-connected GUI
 			reqSeq = 0;
+			lastPlan = null; // a new view starts with no known plan; never apply the old one to it
 			send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, meta });
 
 			// Flush existing history IMMEDIATELY on attach. Without this, a session that
@@ -650,7 +728,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 					const resolve = pending.get(msg.reqId);
 					if (resolve) {
 						pending.delete(msg.reqId);
-						resolve({ ops: Array.isArray(msg.ops) ? msg.ops : [], groups: Array.isArray(msg.groups) ? msg.groups : [] });
+						// A delivered plan — possibly genuinely empty. "plan" (not the "timeout"/"unsent"
+						// sentinels) tells the context hook the GUI actually replied, so an empty reply
+						// is honored as "no folds" and cached, not mistaken for a slow/absent GUI.
+						resolve({ kind: "plan", plan: { ops: Array.isArray(msg.ops) ? msg.ops : [], groups: Array.isArray(msg.groups) ? msg.groups : [] } });
 					}
 				}
 				if (msg?.type === "unfoldResult" && typeof msg.reqId === "number") {
@@ -748,7 +829,14 @@ export default function accordionLive(pi: ExtensionAPI): void {
 				}
 			});
 			const drop = () => {
-				if (client === ws) client = null;
+				if (client === ws) {
+					client = null;
+					// The active GUI dropped mid-flight: resolve any in-flight plan/unfold/recall
+					// waits at once instead of letting them run out their timers. This matters most
+					// in steering mode, where the plan wait is a multi-second deadline — without this
+					// a disconnect would stall the model call until that deadline elapsed.
+					flushPending();
+				}
 			};
 			ws.on("close", drop);
 			ws.on("error", drop);
@@ -762,20 +850,28 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		});
 	}
 
-	/** Send a sync and await the GUI's plan; resolves an empty plan on timeout, null if unsent. */
-	function requestPlan(reqId: number, full: boolean, blocks: ReturnType<typeof linearize>): Promise<Plan | null> {
+	/**
+	 * Send a sync and await the GUI's plan. Resolves a discriminated PlanResult:
+	 *   • "unsent"  — no GUI attached at call time (nothing sent).
+	 *   • "timeout" — sent, but no reply within PLAN_WAIT_MS (the caller falls back to
+	 *                 the last known plan). The wait is PLAN_DEADLINE_MS under steering.
+	 *   • "plan"    — the GUI replied (delivered via the pending resolver / flushPending).
+	 * The pending resolver is also driven by flushPending() (→ "unsent") on a superseded /
+	 * dropped / shutting-down GUI, so a mid-wait disconnect never runs out the full timer.
+	 */
+	function requestPlan(reqId: number, full: boolean, blocks: ReturnType<typeof linearize>): Promise<PlanResult> {
 		return new Promise((resolve) => {
 			const ws = client;
-			if (!ws || ws.readyState !== 1) return resolve(null);
+			if (!ws || ws.readyState !== 1) return resolve({ kind: "unsent" });
 			const timer = setTimeout(() => {
 				if (pending.has(reqId)) {
 					pending.delete(reqId);
-					resolve({ ops: [], groups: [] }); // delivered but no reply in time → passthrough
+					resolve({ kind: "timeout" }); // delivered but no reply in time → caller applies last known plan
 				}
-			}, REQUEST_TIMEOUT_MS);
-			pending.set(reqId, (plan) => {
+			}, PLAN_WAIT_MS);
+			pending.set(reqId, (r) => {
 				clearTimeout(timer);
-				resolve(plan);
+				resolve(r);
 			});
 			send(ws, { type: "sync", reqId, full, blocks, contextWindow });
 		});
@@ -818,9 +914,19 @@ export default function accordionLive(pi: ExtensionAPI): void {
 
 	// ── lifecycle ──────────────────────────────────────────────────────────────
 	pi.on("session_start", (_event, ctx: ExtensionContext) => {
+		// Invalidate any `context` await still in flight from the OLD session BEFORE resetting
+		// the cursor below — mirrors the GUI-reconnect path (flushPending() then epoch++).
+		// Without this, a plan for the old session that lands after this switch still passes
+		// the epoch guard (`epoch !== myEpoch`) and applies against the NEW session: it
+		// re-inflates `sentCount` with the old session's block count (delta-cursor corruption)
+		// and overwrites `lastPlan` with the old session's plan.
+		flushPending();
+		epoch++;
 		latestCtx = ctx;
 		sessionId = `s-${process.pid}-${Date.now()}`;
 		sentCount = 0;
+		lastPlan = null; // fresh session → no known plan yet (cursor also resets here)
+		lastPlanRttMs = null;
 		pendingSince = [];
 		// Seed the cache from the session itself. For a fresh session this is []; for a
 		// RESUMED/loaded session (reason "resume"/"startup"/"fork") it is the full prior
@@ -898,6 +1004,11 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// only an explicit `{ messages }` replaces them. Every passthrough path below
 	// returns undefined, so we never alter a model call without a plan.
 	pi.on("context", async (event, ctx: ExtensionContext) => {
+		// Clear any stash from a previous request FIRST, before the no-GUI early return below.
+		// Otherwise an aborted turn (no assistant message_end to consume it) followed by a GUI
+		// detach leaves the old RTT sitting in the stash, and the next message_end — for an
+		// unrelated message — stamps it on the wrong reply.
+		lastPlanRttMs = null;
 		latestCtx = ctx;
 		const myEpoch = epoch;
 		// Refresh model/usage in memory only — NO disk I/O on the model-call critical
@@ -916,9 +1027,48 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		const fresh = all.slice(sentCount);
 		const reqId = ++reqSeq;
 		const full = sentCount === 0;
-		const plan = await requestPlan(reqId, full, fresh);
-		if (plan === null) return; // couldn't deliver → pass through, don't advance
+		// Measure the plan round-trip (Feature C). Stashed for `message_end` regardless of
+		// outcome — the assistant message this request produces waited this long, whatever
+		// the result (applied / stale-fallback / timeout).
+		const t0 = Date.now();
+		const result = await requestPlan(reqId, full, fresh);
+		lastPlanRttMs = Date.now() - t0;
+
 		if (epoch !== myEpoch) return; // GUI reconnected mid-flight → don't apply/advance
+		if (result.kind === "unsent") return; // couldn't deliver (no GUI / dropped) → pass through, don't advance
+
+		if (result.kind === "timeout") {
+			// Issue #58: the plan missed the wait. Blocks WERE delivered, so advance the cursor
+			// as before — but instead of shipping unfolded, re-apply the LAST KNOWN plan (a
+			// one-turn-stale, id-addressed plan is strictly better than none; applyPlan passes
+			// through ops for ids no longer present). Never silent: log cause + reqId + elapsed.
+			sentCount = Math.max(sentCount, all.length);
+			const elapsed = lastPlanRttMs;
+			const hasStale = !!lastPlan && (lastPlan.ops.length > 0 || lastPlan.groups.length > 0);
+			// Three distinct outcomes, not two: a cached EMPTY plan (lastPlan set, 0 ops/groups —
+			// the conductor explicitly asked for no folds) still passes through unfolded, same as
+			// genuinely having no cached plan at all — but the two causes are worth telling apart
+			// in the log rather than both reading as "no cached plan".
+			const detail = hasStale
+				? `applying last known plan (${lastPlan!.ops.length} ops, ${lastPlan!.groups.length} groups)`
+				: lastPlan
+					? "cached plan is empty (no folds) — passing through unfolded"
+					: "no cached plan — passing through unfolded";
+			if (STEERING) {
+				// Steering promised to hold the budget and didn't: shout, don't whisper.
+				console.error(`[accordion] STEERING deadline missed: plan reqId=${reqId} did not arrive within ${PLAN_WAIT_MS}ms (waited ${elapsed}ms) — ${detail}`);
+			} else {
+				console.warn(`[accordion] plan timeout: reqId=${reqId} after ${elapsed}ms — ${detail}`);
+			}
+			if (hasStale) return { messages: applyPlan(event.messages as unknown as PiMessage[], lastPlan!.ops, lastPlan!.groups) as unknown as AgentMessage[] };
+			return;
+		}
+
+		// result.kind === "plan": the GUI replied. Cache it (even when empty — that is the
+		// conductor explicitly asking for NO folds, and caching it stops a later timeout from
+		// wrongly resurrecting an older non-empty plan).
+		const plan = result.plan;
+		lastPlan = plan;
 		sentCount = Math.max(sentCount, all.length); // advance cursor; never rewind (a message_end during the await may have advanced it further)
 		if (plan.ops.length === 0 && plan.groups.length === 0) return; // empty plan → pass through
 
@@ -968,9 +1118,40 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// View-only: no reqId registered in `pending`; folding may only happen at `context`.
 	// The `agent_end` handler below remains the loop-end backstop — with dedup it is
 	// harmless; it catches anything missed (e.g. if message_end fired with no GUI).
+	//
+	// This handler ALSO carries the Feature C RTT injection. That is deliberately merged
+	// here rather than split into a second `pi.on("message_end", …)`:
+	//   • The vendored pi SDK composes multiple handlers on one event reliably (loader.js
+	//     pushes each into a per-event array; runner.js emitMessageEnd chains their returned
+	//     messages, so a second handler WOULD work in production) — but smoke.mjs's mock
+	//     `pi.on` overwrites per event (last-wins), so a second handler would silently drop
+	//     one of the two in tests.
+	//   • Injection must run even when no GUI is attached, otherwise a value stashed while a
+	//     GUI was briefly attached could leak onto a later assistant message. Keeping it in
+	//     ONE handler, above the no-GUI guard, guarantees the stash is always consumed+cleared.
+	// So the RTT stamp is computed first (and returned at every exit), then the view-only
+	// sync push runs only when a GUI is attached.
 	pi.on("message_end", (event) => {
+		// ── Feature C: stamp usage.rttMs onto the assistant message this request produced ──
+		// Persisted verbatim: pi applies this replacement in place (agent-session._replace-
+		// MessageInPlace) and SessionManager.appendMessage JSON-serializes the whole message,
+		// so arbitrary `usage` keys survive to the session file. Consume+clear the stash so a
+		// message with no preceding context RTT (null) gets no field.
+		let replacement: AgentMessage | undefined;
+		const finished = event.message as unknown as PiMessage & { role?: string; usage?: Record<string, unknown> };
+		if (finished && finished.role === "assistant" && lastPlanRttMs !== null) {
+			const rttMs = lastPlanRttMs;
+			lastPlanRttMs = null;
+			replacement = { ...(event.message as object), usage: { ...(finished.usage ?? {}), rttMs } } as unknown as AgentMessage;
+		}
+
+		// pi's MessageEndEventResult requires `{ message }` — emitMessageEnd does
+		// `if (!handlerResult?.message) continue;`, so a bare message is silently
+		// dropped and the RTT stamp never reaches the session file. Wrap every exit.
+		const finish = () => (replacement ? { message: replacement } : undefined);
+
 		const ws = client;
-		if (!ws || ws.readyState !== 1) return; // no GUI → nothing to push
+		if (!ws || ws.readyState !== 1) return finish(); // no GUI → nothing to push (still stamp RTT)
 
 		// Guaranteed teardown (invariant #2, ADR 0003): sweep all active ghosts as a
 		// backstop. Any ghost not already resolved by its own *_end frame is cleared
@@ -997,11 +1178,12 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		if (msgIds.size > 0 && !alreadySeen) pendingSince.push(msg);
 
 		const all = linearize([...lastMessages, ...pendingSince]);
-		if (all.length <= sentCount) return; // nothing new since the last sync
+		if (all.length <= sentCount) return finish(); // nothing new to push (RTT stamp still returned)
 		const reqId = ++reqSeq;
 		const full = sentCount === 0;
 		send(ws, { type: "sync", reqId, full, blocks: all.slice(sentCount) });
 		sentCount = all.length; // advance cursor; agent_end and next context will dedup
+		return finish(); // hand the RTT-stamped assistant message back to pi, wrapped per MessageEndEventResult (undefined = unchanged)
 	});
 
 	// ── live view: push the assistant's reply the moment the loop ends ──────────
