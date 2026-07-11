@@ -865,6 +865,12 @@ fn focus_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// Read an environment variable by name (used for THERMO_HOST etc.).
+#[tauri::command]
+fn read_env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
 /// Bring the main window to the foreground (used when a focus request fires).
 #[tauri::command]
 fn focus_window(app: tauri::AppHandle) {
@@ -896,7 +902,8 @@ pub fn run() {
             stop_conductor,
             launch_mock_session,
             stop_mock_session,
-            mock_session_running
+            mock_session_running,
+            read_env_var
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

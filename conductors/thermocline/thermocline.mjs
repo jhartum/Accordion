@@ -38,7 +38,8 @@ import { scoreCandidates, tailTextFromView } from "./scorer.mjs";
 const ID = "thermocline";
 const LABEL = "Thermocline";
 const PORT = Number(process.env.THERMO_PORT || 7703);
-const URL = `ws://127.0.0.1:${PORT}`;
+const HOST = process.env.THERMO_HOST || "127.0.0.1";
+const URL = `ws://${HOST === "0.0.0.0" ? "127.0.0.1" : HOST}:${PORT}`;
 
 // `node thermocline.mjs --smoke` runs the inline smoke harness instead of the WS server (it must
 // NOT bind a port or advertise a heartbeat). See the bottom of the file.
@@ -58,6 +59,11 @@ const CFG = {
 
 function log(msg) {
 	process.stderr.write(`[${new Date().toISOString()}] ${msg}\n`);
+}
+
+function peerOf(ws) {
+	const socket = ws?._socket;
+	return socket?.remoteAddress ? `${socket.remoteAddress}:${socket.remotePort ?? "?"}` : "unknown";
 }
 
 // ── Auto-discovery: advertise a heartbeat file under ~/.accordion/conductors/ ──
@@ -105,9 +111,8 @@ const PERSIST_DIR = REG_DIR;
 
 /**
  * Deterministic key for a session — used as part of the persist filename so each session keeps
- * its own deep zone. Prefer a stable session id when the host supplies one (a fork may extend the
- * `host/hello` session payload — the contract today is only {title,model,cwd}, but an `id` is the
- * primary key when present). Otherwise hash title|model|cwd.
+ * its own deep zone. Prefer the optional stable session id supplied in `host/hello`; otherwise
+ * hash title|model|cwd.
  *
  * Returns `null` when there is no usable identity (no id AND any of title/model/cwd is missing) so
  * the caller skips persistence entirely — two under-specified sessions must NOT hash to the same
@@ -620,7 +625,7 @@ function commit(ws, state, view, plan, digests) {
 	state.lastAction = "epoch";
 	state.rescoreNeeded = true; // tail moved; rescore before the next epoch
 	const capForLog = working.cap || capOfView(view);
-	log(`COMMIT: ${working.folds.length} folds · ${working.strata.length} strata → projected ~${(finalProjected / Math.max(1, capForLog) * 100).toFixed(0)}% full`);
+	log(`COMMIT: ${working.folds.length} folds · ${working.strata.length} strata → projected=${finalProjected}/${capForLog} (~${(finalProjected / Math.max(1, capForLog) * 100).toFixed(0)}% full)`);
 }
 
 // ── HOLD: re-derive commands from current applied plan, send only if changed ──
@@ -732,7 +737,8 @@ async function prepareEpoch(ws, state, view, token) {
 // binding a port; the server is only created + wired below, guarded by !SMOKE.
 function onConnection(ws) {
 	const state = freshState();
-	log("Accordion connected");
+	const peer = peerOf(ws);
+	log(`Accordion connected peer=${peer}`);
 
 	ws.send(
 		JSON.stringify({
@@ -756,6 +762,7 @@ function onConnection(ws) {
 		// ── host/hello — session identity + optional state restore ──
 		if (msg.type === "host/hello") {
 			state.sessionKey = sessionKey(msg.session ?? {});
+			log(`session=${state.sessionKey ?? "unknown"} peer=${peer}`);
 			// A null key means the session is under-specified (no id, missing title/model/cwd):
 			// skip restore AND later persistence so we never read/write a shared "null" file.
 			const saved = state.sessionKey ? loadPersistedState(state.sessionKey) : null;
@@ -975,7 +982,7 @@ function onConnection(ws) {
 		// prepare is discarded when it resolves — the emergency commit is the ground truth
 		// and a stale prepare must not layer on top of it (#3).
 		if (fill > 1.0) {
-			log(`EMERGENCY: fill ${(fill * 100).toFixed(0)}% > 100% — deterministic compaction`);
+			log(`EMERGENCY: session=${state.sessionKey ?? "unknown"} rev=${view.rev ?? "?"} live=${view.liveTokens} cap=${cap} fill=${(fill * 100).toFixed(0)}% — deterministic compaction`);
 			++state.prepareToken; // discard any in-flight prepare
 			state.preparing = false;
 			advanceGraduationOnce(); // this epoch advances dwell (once per tick)
@@ -1009,7 +1016,7 @@ function onConnection(ws) {
 		sendStatus(ws, state);
 	});
 
-	ws.on("close", () => {
+	ws.on("close", (code, reason) => {
 		// Abort any in-flight probe — it's scoring a context nobody is listening to.
 		state.abort.abort();
 		// Reject any pending cap requests (their promises will never settle otherwise).
@@ -1022,7 +1029,8 @@ function onConnection(ws) {
 			clearTimeout(timer);
 			reject(new Error("ws closed"));
 		}
-		log("Accordion disconnected");
+		const detail = reason?.length ? ` reason=${reason.toString()}` : "";
+		log(`Accordion disconnected peer=${peer} session=${state.sessionKey ?? "unknown"} code=${code ?? "unknown"}${detail}`);
 	});
 }
 
@@ -1271,7 +1279,7 @@ async function runSmoke() {
 
 if (!SMOKE) {
 	const { WebSocketServer } = await import("ws");
-	const wss = new WebSocketServer({ host: "127.0.0.1", port: PORT });
+	const wss = new WebSocketServer({ host: HOST, port: PORT });
 	wss.on("connection", onConnection);
 	log(`${LABEL} listening on ${URL}`);
 	log(`waters: warm=${(CFG.warmWater * 100).toFixed(0)}% high=${(CFG.highWater * 100).toFixed(0)}% low=${(CFG.lowWater * 100).toFixed(0)}%  advertised at ${REG_FILE}`);

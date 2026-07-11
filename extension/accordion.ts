@@ -114,7 +114,9 @@ const PLAN_TIMEOUT_MS = envPositiveInt("ACCORDION_PLAN_TIMEOUT_MS", 250);
 // (interactive steering, or a benchmark whose cap must hold) actually waits for the plan.
 // Either way a missed wait falls back (stale plan / passthrough). Which of the two applies
 // is decided PER REQUEST from the armed flag snapshotted in the `context` hook, not here.
-const PLAN_DEADLINE_MS = envPositiveInt("ACCORDION_PLAN_DEADLINE_MS", 10_000);
+// Must exceed the app's CONDUCTOR_WAIT_MS (30s) so the extension does not time out before
+// the remote conductor's fresh commands arrive. 35s = 30s + 5s safety margin.
+const PLAN_DEADLINE_MS = envPositiveInt("ACCORDION_PLAN_DEADLINE_MS", 35_000);
 // Unfold replies arrive during the agent's OWN turn (not on the model-call critical
 // path), so a generous wait is fine — the user's next message isn't blocked.
 const UNFOLD_TIMEOUT_MS = 2000;
@@ -130,6 +132,7 @@ const FOCUS_PATH = path.join(REGISTRY_ROOT, FOCUS_FILE);
 
 const ACCORDION_APP_FLAG = "accordion-app";
 const ACCORDION_APP_ENV = "ACCORDION_APP_PATH";
+const ACCORDION_PORT_ENV = "ACCORDION_PORT";
 
 type LaunchSource = "cli" | "env" | "default";
 type LaunchResult =
@@ -572,7 +575,12 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			// any other origin because we set no CORS headers.
 			if (u.pathname === "/__accordion/meta") {
 				res.writeHead(200, { "Content-Type": "application/json" });
-				res.end(JSON.stringify({ served: true, sessionId, protocolVersion: PROTOCOL_VERSION }));
+				res.end(JSON.stringify({
+					served: true,
+					sessionId,
+					protocolVersion: PROTOCOL_VERSION,
+					thermoHost: process.env.ACCORDION_THERMO_HOST || null,
+				}));
 				return;
 			}
 
@@ -661,6 +669,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			// One HTTP server hosts BOTH halves on the SAME ephemeral port:
 			//   • HTTP GETs → handleHttp (the browser build, token-gated)
 			//   • WS upgrades → the WebSocketServer below (UNAUTHENTICATED, unchanged)
+			// ACCORDION_PORT env ⇒ fixed port (for Tailscale Serve, reverse proxy, etc.)
 			// port 0 ⇒ OS assigns a free ephemeral port (one server per pi session).
 			httpServer = http.createServer(handleHttp);
 			// Attach the WS server to the HTTP server (NOT { port: 0 }) so the upgrade
@@ -672,7 +681,8 @@ export default function accordionLive(pi: ExtensionAPI): void {
 				httpServer = null;
 				wss = null;
 			});
-			httpServer.listen(0, "127.0.0.1", () => {
+			const bindPort = parseInt(process.env[ACCORDION_PORT_ENV], 10) || 0;
+			httpServer.listen(bindPort, "0.0.0.0", () => {
 				const addr = httpServer?.address();
 				if (addr && typeof addr === "object") {
 					port = addr.port;
@@ -691,6 +701,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		}
 		wss.on("connection", (ws: WebSocket) => {
 			flushPending(); // supersede any prior GUI: its in-flight requests pass through
+			client?.close(); // close old GUI so it sees onclose, not a silent zombie
 			client = ws;
 			epoch++;
 			sentCount = 0; // re-sync the whole context to the freshly-connected GUI

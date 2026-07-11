@@ -4,7 +4,7 @@
 // folding a real model call is never silently carried from one agent to the next
 // (adversarial review Q5). Intentionally NOT persisted: the safe state (off) is
 // always the starting state for a fresh attach.
-export const folding = $state<{ enabled: boolean }>({ enabled: false });
+export const folding = $state<{ enabled: boolean }>({ enabled: true });
 
 export function setFolding(on: boolean): void {
 	folding.enabled = on;

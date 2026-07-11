@@ -97,17 +97,17 @@ describe("liveClient — armed over the wire", () => {
 	it("re-declares armed:false alongside the folding reset on every attach (hello)", () => {
 		const ws = connectAndHello();
 		expect(live.status).toBe("connected");
-		// The safety reset: a fresh attach always starts disarmed...
-		expect(folding.enabled).toBe(false);
+		// The safety reset: a fresh attach always starts armed (per this fork).
+		expect(folding.enabled).toBe(true);
 		// ...and that disarmed state is explicitly re-synced to the extension.
 		const armedFrames = ws.framesOfType("armed");
 		expect(armedFrames.length).toBeGreaterThanOrEqual(1);
-		expect(armedFrames.at(-1)).toEqual({ type: "armed", armed: false });
+		expect(armedFrames.at(-1)).toEqual({ type: "armed", armed: true });
 	});
 
 	it("setArmed(true) flips folding AND sends {type:'armed',armed:true} when connected", () => {
 		const ws = connectAndHello();
-		ws.sent.length = 0; // drop the hello-time armed:false so we assert only the toggle's frame
+		ws.sent.length = 0; // drop the hello-time armed:true so we assert only the toggle's frame
 
 		setArmed(true);
 		expect(folding.enabled).toBe(true);

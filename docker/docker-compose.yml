@@ -1,0 +1,54 @@
+# Thermocline conductor — runs alongside pi on same host.
+#
+# CPU (deterministic folding, no probe):
+#   docker compose -f docker/docker-compose.yml --profile cpu up -d --build
+#
+# GPU (attention probe on CUDA — WSL2 + snap docker):
+#   bash docker/setup-wsl-libs.sh        # one-time: copy WSL driver libs to ~/wsl-libs
+#   docker compose -f docker/docker-compose.yml --profile gpu up -d --build
+#
+# On native Linux with nvidia-container-runtime, use:
+#   docker run --gpus all ...  (no WSL mounts needed; entrypoint.sh is a no-op extra)
+
+services:
+  thermocline:
+    profiles: ["cpu"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: cpu
+    image: accordion-thermocline:cpu
+    container_name: thermocline
+    restart: unless-stopped
+    network_mode: host  # shares host network — pi reaches thermocline via 127.0.0.1:7703
+    environment:
+      - THERMO_HOST=0.0.0.0
+      - THERMO_PORT=7703
+      # Optional tuning:
+      # - THERMO_HIGH_WATER=0.9
+      # - THERMO_LOW_WATER=0.7
+      # - THERMO_CEILING_FRAC=0.2
+
+  thermocline-gpu:
+    profiles: ["gpu"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: gpu
+    image: accordion-thermocline:gpu
+    container_name: thermocline-gpu
+    restart: unless-stopped
+    network_mode: host
+    # WSL2 GPU passthrough without nvidia-container-runtime:
+    #   /dev/dxg is the WSL2 GPU paravirtualization device the CUDA loader talks to.
+    #   The driver libs (loader stubs + real driver-store libs) live in ~/wsl-libs
+    #   (populated by setup-wsl-libs.sh) and are bind-mounted at the exact paths
+    #   the loader expects. WSL_DRIVER_DIR comes from docker/.env (auto-generated).
+    devices:
+      - /dev/dxg:/dev/dxg
+    volumes:
+      - ${WSL_LIBS_DIR:-/home/jhartum/wsl-libs}/lib:/usr/lib/wsl/lib:ro
+      - ${WSL_LIBS_DIR:-/home/jhartum/wsl-libs}/drivers:/usr/lib/wsl/drivers/${WSL_DRIVER_DIR:-nv_dispsi.inf_amd64_PLACEHOLDER}:ro
+    environment:
+      - THERMO_HOST=0.0.0.0
+      - THERMO_PORT=7703

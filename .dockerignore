@@ -1,0 +1,13 @@
+node_modules/
+.git/
+app/node_modules/
+extension/node_modules/
+conductors/*/node_modules/
+conductors/attention-folder/probe/.venv
+app/.svelte-kit/
+app/build/
+app/src-tauri/target/
+extension/dist/
+*.md
+*.log
+*.tmp

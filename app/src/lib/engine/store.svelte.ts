@@ -926,8 +926,8 @@ export class AccordionStore {
 	 * it; it now delegates to whatever conductor is attached (the built-in folder by
 	 * default, or none ⇒ raw).
 	 */
-	refold(): void {
-		this.runConductor();
+	refold(conductor: Conductor | null = this.conductor): void {
+		this.runConductor(conductor);
 	}
 
 	/**
@@ -943,7 +943,7 @@ export class AccordionStore {
 	 * Non-reentrant: a `group` command routes through `createGroup`, which calls `refold`
 	 * again — the latch makes that inner call a no-op so the outer pass owns the result.
 	 */
-	private runConductor(): void {
+	private runConductor(conductor: Conductor | null = this.conductor): void {
 		if (this.conducting) return;
 		this.conducting = true;
 		try {
@@ -969,7 +969,7 @@ export class AccordionStore {
 			// applied batch (a remote one still thinking); `[]` ⇒ clear to raw; no conductor ⇒ raw.
 			let result: Command[] | null;
 			try {
-				result = this.conductor ? this.conductor.conduct(this.buildView(protectedFrom)) : [];
+				result = conductor ? conductor.conduct(this.buildView(protectedFrom)) : [];
 			} catch (e) {
 				// A buggy conductor (first-party, not an adversary) must never wedge the store or
 				// abort the live model-call path. Hold the last applied state and surface the error.

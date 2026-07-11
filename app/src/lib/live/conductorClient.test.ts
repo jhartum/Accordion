@@ -134,6 +134,14 @@ describe("RemoteRunner — handshake & context push", () => {
 		expect(u.blocks[0].text).toBeDefined(); // wants:"full"
 	});
 
+	it("includes the stable live session id in host/hello", () => {
+		const store = makeStore(1);
+		store.meta.sessionId = "session-42";
+		const { runner, ws } = connectRunner(store);
+		expect(ws.framesOfType("host/hello")[0].session.id).toBe("session-42");
+		runner.close();
+	});
+
 	it("honours wants:shape from the very first context frame (no full text leaked)", () => {
 		const { ws } = connectRunner(makeStore(2));
 		sendHello(ws, "shape");
@@ -609,6 +617,74 @@ describe("RemoteRunner — involvement locks from conductor/hello (ADR 0011)", (
 
 		expect(runner.locks).toBeUndefined();
 
+		runner.close();
+	});
+});
+
+describe("RemoteRunner — freshCommands (over-budget wait)", () => {
+	it("resolves null immediately when not greeted", async () => {
+		const store = makeStore(3);
+		store.setProtect(0);
+		const { runner } = connectRunner(store); // socket open, host/hello sent — NOT greeted
+		// No sendHello: greeted is false ⇒ freshCommands must not wait.
+		expect(await runner.freshCommands(50)).toBeNull();
+		runner.close();
+	});
+
+	it("resolves null on timeout when the conductor is silent", async () => {
+		const store = makeStore(3);
+		store.setProtect(0);
+		const { runner, ws } = connectRunner(store);
+		sendHello(ws, "full"); // greeted; rev bumped to 1
+		// No conductor/commands emitted ⇒ freshCommands times out and floors.
+		expect(await runner.freshCommands(50)).toBeNull();
+		runner.close();
+	});
+
+	it("resolves immediately when its socket closes", async () => {
+		const store = makeStore(3);
+		store.setProtect(0);
+		const { runner, ws } = connectRunner(store);
+		sendHello(ws, "full");
+		const pending = runner.freshCommands(1000);
+		ws.close();
+		const result = await Promise.race([
+			pending,
+			new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 20)),
+		]);
+		expect(result).toBeNull();
+		runner.close();
+	});
+
+	it("resolves with the fresh command set when conductor/commands arrives", async () => {
+		const store = makeStore(3);
+		store.setProtect(0); // disable protection so the fold is admitted on the tiny fixture
+		const { runner, ws } = connectRunner(store);
+		sendHello(ws, "full"); // greeted; this.rev === 1
+		// Start waiting BEFORE the reply arrives — this is the live-sync over-budget path.
+		const pending = runner.freshCommands(1000);
+		// Conductor emits a FRESH command set for the current rev (rev:1 ⇒ not stale).
+		ws.emit({ type: "conductor/commands", rev: 1, commands: [{ kind: "fold", ids: ["m0:p0"] }] });
+		const cmds = await pending;
+		expect(cmds).toEqual([{ kind: "fold", ids: ["m0:p0"] }]);
+		// The fold was applied to the store by the commands handler BEFORE resolving the waiter.
+		expect(store.isFolded(store.get("m0:p0")!)).toBe(true);
+		runner.close();
+	});
+
+	it("stale-rev conductor/commands do NOT resolve the waiter (waits for fresh)", async () => {
+		const store = makeStore(3);
+		store.setProtect(0);
+		const { runner, ws } = connectRunner(store);
+		sendHello(ws, "full"); // greeted; this.rev === 1
+		const pending = runner.freshCommands(2000);
+		// Emit a STALE rev (0 < 1) — the guard drops it; the waiter must keep waiting.
+		ws.emit({ type: "conductor/commands", rev: 0, commands: [{ kind: "fold", ids: ["m1:p0"] }] });
+		// The stale fold must NOT have been applied.
+		expect(store.isFolded(store.get("m1:p0")!)).toBe(false);
+		// Now a FRESH rev resolves it.
+		ws.emit({ type: "conductor/commands", rev: 1, commands: [{ kind: "fold", ids: ["m0:p0"] }] });
+		expect(await pending).toEqual([{ kind: "fold", ids: ["m0:p0"] }]);
 		runner.close();
 	});
 });
