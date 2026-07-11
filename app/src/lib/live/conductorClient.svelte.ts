@@ -106,6 +106,9 @@ export class RemoteRunner implements Conductor {
 	get isDead(): boolean { return this._dead; }
 	/** The conductor's last desired command set; `null` until it has ever spoken (⇒ hold/raw). */
 	private desired: Command[] | null = null;
+	/** Pending fresh-commands waiter, set by `freshCommands()`. Resolved by a fresh command
+	 * batch, timeout, or either socket-close path. `null` when nobody is waiting. */
+	private freshWaiter: ((cmds: Command[] | null) => void) | null = null;
 	private wants: ContentMode = "full";
 	private rev = 0;
 	private lastRev = 0;
@@ -128,6 +131,39 @@ export class RemoteRunner implements Conductor {
 		if (this.suppressUpdate) this.suppressUpdate = false;
 		else if (this.greeted) this.pushContext(view); // hold the first push until wants is known
 		return this.desired;
+	}
+
+	/**
+	 * Wait for the conductor to emit a FRESH command set for the current rev — one that
+	 * arrives AFTER this call, not the stale `desired` we already hold. Used by the live
+	 * sync handler when the context is over budget: rather than reply with a stale (possibly
+	 * empty) plan and overflow the live model call, it awaits fresh folds here.
+	 *
+	 * Resolves with the fresh `Command[]` (the `conductor/commands` handler has already
+	 * applied them to the store by the time we resolve), or `null` if the conductor is dead,
+	 * not greeted, or silent for `timeoutMs` (⇒ caller falls back to the deterministic
+	 * floor). Never rejects; the timeout bounds the worst-case wait so a hung conductor can
+	 * never wedge the live model-call path.
+	 */
+	freshCommands(timeoutMs: number): Promise<Command[] | null> {
+		return new Promise((resolve) => {
+			if (!this.greeted || this._dead) return resolve(null);
+			let timer: ReturnType<typeof setTimeout>;
+			const waiter = (cmds: Command[] | null) => {
+				clearTimeout(timer);
+				this.freshWaiter = null;
+				resolve(cmds);
+			};
+			timer = setTimeout(() => {
+				if (this.freshWaiter === waiter) this.freshWaiter = null;
+				resolve(null);
+			}, timeoutMs);
+			this.freshWaiter = waiter;
+		});
+	}
+
+	private settleFreshWaiter(cmds: Command[] | null): void {
+		this.freshWaiter?.(cmds);
 	}
 
 	/**
@@ -174,7 +210,12 @@ export class RemoteRunner implements Conductor {
 			const hello: HostHelloMessage = {
 				type: "host/hello",
 				conductorProtocol: CONDUCTOR_PROTOCOL_VERSION,
-				session: { title: this.store.meta.title, model: this.store.meta.model, cwd: this.store.meta.cwd },
+				session: {
+					title: this.store.meta.title,
+					model: this.store.meta.model,
+					cwd: this.store.meta.cwd,
+					...(this.store.meta.sessionId ? { id: this.store.meta.sessionId } : {}),
+				},
 				budget: this.store.budget,
 				contextWindow: this.store.contextWindow,
 			};
@@ -200,6 +241,7 @@ export class RemoteRunner implements Conductor {
 		};
 		ws.onclose = () => {
 			if (this.ws !== ws) return;
+			this.settleFreshWaiter(null);
 			this.ws = null;
 			if (!this.manualClose) {
 				// Unexpected drop: clear stale commands so conduct() returns [] (raw) rather
@@ -228,6 +270,7 @@ export class RemoteRunner implements Conductor {
 
 	close(finalStatus?: "idle" | "error", finalDetail?: string): void {
 		this.manualClose = true;
+		this.settleFreshWaiter(null);
 		const ws = this.ws;
 		this.ws = null;
 		clearConductorStatus(); // swapped/detached → drop any telemetry line
@@ -294,6 +337,10 @@ export class RemoteRunner implements Conductor {
 				this.store.refold();
 				// Report back exactly what the host had to clamp.
 				this.send({ type: "host/commandResult", rev: this.lastRev, reports: this.store.lastReports });
+				// Unblock a live sync handler waiting (via `freshCommands`) for exactly this fresh
+				// command set. The store has just been refolded above with these commands, so the
+				// waiter only needs to resume and recompute its plan — no extra refold required.
+				this.settleFreshWaiter(this.desired);
 				break;
 			}
 			case "cap/request":
@@ -456,6 +503,14 @@ export function activeRemoteRunner(): RemoteRunner | null {
 	return activeRemote;
 }
 
+/** Close this app window's conductor when its live pi socket goes away. */
+export function closeActiveRemote(): void {
+	if (!activeRemote) return;
+	// ponytail: app-side ownership is enough; add server arbitration only for concurrent writers.
+	activeRemote.close();
+	activeRemote = null;
+}
+
 /**
  * Attach the conductor identified by `id` to `store`. `null`/`"none"` ⇒ detach (the ADR 0011
  * kill switch: freezes the current folded view as human-owned, then unlocks all controls);
@@ -487,10 +542,7 @@ export function attachConductor(store: AccordionStore, id: string | null, availa
 			: true);
 	if (alreadyCorrect) return;
 
-	if (activeRemote) {
-		activeRemote.close();
-		activeRemote = null;
-	}
+	closeActiveRemote();
 	store.onHumanOverride = null;
 	lastStore = store;
 	lastId = norm;

@@ -240,7 +240,14 @@ var FOCUS_FILE = "focus.json";
 var HEARTBEAT_INTERVAL_MS = 5e3;
 
 // accordion.ts
-var REQUEST_TIMEOUT_MS = 250;
+function envPositiveInt(name, fallback) {
+  const raw = process.env[name];
+  if (typeof raw !== "string") return fallback;
+  const n = Number(raw.trim());
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+var PLAN_TIMEOUT_MS = envPositiveInt("ACCORDION_PLAN_TIMEOUT_MS", 250);
+var PLAN_DEADLINE_MS = envPositiveInt("ACCORDION_PLAN_DEADLINE_MS", 35e3);
 var UNFOLD_TIMEOUT_MS = 2e3;
 var RECALL_TIMEOUT_MS = 2e3;
 var HOME = process.env.ACCORDION_HOME || os.homedir();
@@ -370,6 +377,9 @@ function accordionLive(pi) {
   let reqSeq = 0;
   let epoch = 0;
   const pending = /* @__PURE__ */ new Map();
+  let lastPlan = null;
+  let armed = false;
+  let lastPlanRttMs = null;
   let unfoldSeq = 0;
   const pendingUnfold = /* @__PURE__ */ new Map();
   let recallSeq = 0;
@@ -386,7 +396,7 @@ function accordionLive(pi) {
   let heartbeat = null;
   const attached = () => !!client && client.readyState === 1;
   function flushPending() {
-    for (const resolve2 of pending.values()) resolve2({ ops: [], groups: [] });
+    for (const resolve2 of pending.values()) resolve2({ kind: "unsent" });
     pending.clear();
     for (const resolve2 of pendingUnfold.values()) resolve2(null);
     pendingUnfold.clear();
@@ -646,6 +656,8 @@ function accordionLive(pi) {
       epoch++;
       sentCount = 0;
       reqSeq = 0;
+      lastPlan = null;
+      armed = false;
       send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, meta });
       const live = readSessionMessages(latestCtx);
       if (live.length) lastMessages = live;
@@ -666,8 +678,12 @@ function accordionLive(pi) {
           const resolve2 = pending.get(msg.reqId);
           if (resolve2) {
             pending.delete(msg.reqId);
-            resolve2({ ops: Array.isArray(msg.ops) ? msg.ops : [], groups: Array.isArray(msg.groups) ? msg.groups : [] });
+            resolve2({ kind: "plan", plan: { ops: Array.isArray(msg.ops) ? msg.ops : [], groups: Array.isArray(msg.groups) ? msg.groups : [] } });
           }
+        }
+        if (msg?.type === "armed" && typeof msg.armed === "boolean") {
+          armed = msg.armed;
+          send(ws, { type: "armedAck", armed });
         }
         if (msg?.type === "unfoldResult" && typeof msg.reqId === "number") {
           const resolve2 = pendingUnfold.get(msg.reqId);
@@ -748,7 +764,11 @@ function accordionLive(pi) {
         }
       });
       const drop = () => {
-        if (client === ws) client = null;
+        if (client === ws) {
+          client = null;
+          armed = false;
+          flushPending();
+        }
       };
       ws.on("close", drop);
       ws.on("error", drop);
@@ -762,19 +782,20 @@ function accordionLive(pi) {
       wss = null;
     });
   }
-  function requestPlan(reqId, full, blocks) {
+  function requestPlan(reqId, full, blocks, armedNow) {
+    const waitMs = armedNow ? PLAN_DEADLINE_MS : PLAN_TIMEOUT_MS;
     return new Promise((resolve2) => {
       const ws = client;
-      if (!ws || ws.readyState !== 1) return resolve2(null);
+      if (!ws || ws.readyState !== 1) return resolve2({ kind: "unsent" });
       const timer = setTimeout(() => {
         if (pending.has(reqId)) {
           pending.delete(reqId);
-          resolve2({ ops: [], groups: [] });
+          resolve2({ kind: "timeout", waitedMs: waitMs });
         }
-      }, REQUEST_TIMEOUT_MS);
-      pending.set(reqId, (plan) => {
+      }, waitMs);
+      pending.set(reqId, (r) => {
         clearTimeout(timer);
-        resolve2(plan);
+        resolve2(r);
       });
       send(ws, { type: "sync", reqId, full, blocks, contextWindow });
     });
@@ -816,9 +837,14 @@ function accordionLive(pi) {
     });
   }
   pi.on("session_start", (_event, ctx) => {
+    flushPending();
+    epoch++;
     latestCtx = ctx;
     sessionId = `s-${process.pid}-${Date.now()}`;
     sentCount = 0;
+    lastPlan = null;
+    armed = false;
+    lastPlanRttMs = null;
     pendingSince = [];
     lastMessages = readSessionMessages(ctx);
     startedAt = Date.now();
@@ -857,8 +883,10 @@ function accordionLive(pi) {
     }
   });
   pi.on("context", async (event, ctx) => {
+    lastPlanRttMs = null;
     latestCtx = ctx;
     const myEpoch = epoch;
+    const myArmed = armed;
     refreshFromCtx(ctx);
     lastMessages = event.messages;
     pendingSince = [];
@@ -867,9 +895,26 @@ function accordionLive(pi) {
     const fresh = all.slice(sentCount);
     const reqId = ++reqSeq;
     const full = sentCount === 0;
-    const plan = await requestPlan(reqId, full, fresh);
-    if (plan === null) return;
+    const t0 = Date.now();
+    const result = await requestPlan(reqId, full, fresh, myArmed);
+    lastPlanRttMs = Date.now() - t0;
     if (epoch !== myEpoch) return;
+    if (result.kind === "unsent") return;
+    if (result.kind === "timeout") {
+      sentCount = Math.max(sentCount, all.length);
+      const elapsed = lastPlanRttMs;
+      const hasStale = !!lastPlan && (lastPlan.ops.length > 0 || lastPlan.groups.length > 0);
+      const detail = hasStale ? `applying last known plan (${lastPlan.ops.length} ops, ${lastPlan.groups.length} groups)` : lastPlan ? "cached plan is empty (no folds) \u2014 passing through unfolded" : "no cached plan \u2014 passing through unfolded";
+      if (myArmed) {
+        console.error(`[accordion] armed deadline missed: plan reqId=${reqId} did not arrive within ${result.waitedMs}ms (waited ${elapsed}ms) \u2014 ${detail}`);
+      } else {
+        console.warn(`[accordion] plan timeout: reqId=${reqId} after ${elapsed}ms \u2014 ${detail}`);
+      }
+      if (hasStale) return { messages: applyPlan(event.messages, lastPlan.ops, lastPlan.groups) };
+      return;
+    }
+    const plan = result.plan;
+    lastPlan = plan;
     sentCount = Math.max(sentCount, all.length);
     if (plan.ops.length === 0 && plan.groups.length === 0) return;
     return { messages: applyPlan(event.messages, plan.ops, plan.groups) };
@@ -882,8 +927,16 @@ function accordionLive(pi) {
     }
   });
   pi.on("message_end", (event) => {
+    let replacement;
+    const finished = event.message;
+    if (finished && finished.role === "assistant" && lastPlanRttMs !== null) {
+      const rttMs = lastPlanRttMs;
+      lastPlanRttMs = null;
+      replacement = { ...event.message, usage: { ...finished.usage ?? {}, rttMs } };
+    }
+    const finish = () => replacement ? { message: replacement } : void 0;
     const ws = client;
-    if (!ws || ws.readyState !== 1) return;
+    if (!ws || ws.readyState !== 1) return finish();
     sendStream({ type: "stream", phase: "abort", kind: "text", contentIndex: -1 });
     const msg = event.message;
     const msgIds = new Set(linearize([msg]).map((b) => b.id));
@@ -892,11 +945,12 @@ function accordionLive(pi) {
     const alreadySeen = [...msgIds].some((id) => baseIds.has(id) || pendIds.has(id));
     if (msgIds.size > 0 && !alreadySeen) pendingSince.push(msg);
     const all = linearize([...lastMessages, ...pendingSince]);
-    if (all.length <= sentCount) return;
+    if (all.length <= sentCount) return finish();
     const reqId = ++reqSeq;
     const full = sentCount === 0;
     send(ws, { type: "sync", reqId, full, blocks: all.slice(sentCount) });
     sentCount = all.length;
+    return finish();
   });
   pi.on("agent_end", (event, ctx) => {
     latestCtx = ctx;

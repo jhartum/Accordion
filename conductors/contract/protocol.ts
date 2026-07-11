@@ -50,7 +50,7 @@ export type ContentMode = "full" | "shape" | "onDemand";
 export interface HostHelloMessage {
 	type: "host/hello";
 	conductorProtocol: number;
-	session: { title: string; model: string; cwd: string };
+	session: { title: string; model: string; cwd: string; id?: string };
 	budget: number;
 	contextWindow: number | null;
 }

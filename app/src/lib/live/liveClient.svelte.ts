@@ -12,10 +12,11 @@
  */
 import { session, cancelPendingLoad } from "../session.svelte";
 import { AccordionStore } from "../engine/store.svelte";
+import { BuiltinConductor } from "$conductors";
 import { wireToBlock } from "./mapping";
 import { computeFoldOps, computeGroupOps, resolveUnfold, resolveRecall } from "./plan";
 import { folding, setFolding } from "./folding.svelte";
-import { activeRemoteRunner } from "./conductorClient.svelte";
+import { activeRemoteRunner, closeActiveRemote } from "./conductorClient.svelte";
 import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, type ServerMessage, type PlanMessage, type FoldOp, type GroupOp, type UnfoldResultMessage, type RecallResultMessage, type CompleteRequestMessage, type ArmedMessage } from "./protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
 import type { CompletionRequest, CompletionResult } from "$conductors/contract";
@@ -32,6 +33,33 @@ let manualClose = false;
  * for the same reqId is ignored.
  */
 const COMPLETION_TIMEOUT_MS = 120_000;
+
+/**
+ * How long the live sync handler waits for a remote conductor's FRESH commands when the
+ * context is over budget, before falling back to the deterministic built-in floor. Bounded
+ * so a dead/hung conductor can never wedge the live model-call path: either we get real
+ * folds within this window (quality preserved) or we floor (safety). Only the FIRST
+ * over-budget sync in a tool loop typically waits — once folds apply, subsequent syncs are
+ * under budget and reply immediately.
+ *
+ * Tuned for real-world LLM API latency: a remote conductor (e.g. Thermocline) answers a
+ * fold-plan request against a large context in ~5-20s p50, but p99 on a cold/slow provider
+ * can reach 25-30s. 30s covers that while still bounding the worst-case hang for a SILENT
+ * conductor (a dead one resolves null immediately via `isDead`, so this bound only bites
+ * when the socket is alive but the conductor never replies).
+ */
+const CONDUCTOR_WAIT_MS = 30_000;
+
+/**
+ * Serializes sync handling. The sync handler is async (it may await the conductor), so
+ * without serialization a second sync arriving while the first awaits would overlap: both
+ * would read/mutate `session.store` concurrently and their plans could ship out of reqId
+ * order. The chain processes syncs one at a time, in arrival order.
+ */
+let syncChain: Promise<void> = Promise.resolve();
+// The extension sends `hello` immediately before the first `full` sync. Reuse that empty
+// store once so the reactive conductor manager does not open a throwaway remote socket.
+let awaitingInitialFullSync = false;
 
 /**
  * Pending out-of-band completion requests keyed by `reqId`. A conductor calls
@@ -70,6 +98,87 @@ export const live = $state<{ status: "idle" | "connecting" | "connected" | "erro
 function computePlan(): { ops: FoldOp[]; groups: GroupOp[] } {
 	if (!folding.enabled || !session.store) return { ops: [], groups: [] };
 	return { ops: computeFoldOps(session.store), groups: computeGroupOps(session.store) };
+}
+
+/**
+ * Handle a `sync` message: apply committed blocks, compute a fold plan, and reply. Serialized
+ * via `syncChain` so concurrent syncs (the handler is async) cannot overlap.
+ *
+ * Over-budget safety: when a remote conductor is attached and the live context exceeds the
+ * budget AFTER the stale refold, we do NOT reply with the stale (possibly empty) plan — that
+ * would overflow the live model call. Instead we wait (bounded by `CONDUCTOR_WAIT_MS`) for
+ * the conductor's FRESH commands for the current rev. If they arrive, the conductor/commands
+ * handler has already applied them and we reply with the real plan. If the conductor is dead
+ * or silent past the timeout, we fall back to the deterministic built-in floor so the reply
+ * still fits the budget — safety over quality, only in the terminal case.
+ */
+async function handleSync(msg: ServerMessage): Promise<void> {
+	if (msg.type !== "sync") return;
+	if (!session.store) return;
+	const reuseBootstrapStore = msg.full && awaitingInitialFullSync;
+	awaitingInitialFullSync = false;
+	if (msg.full && !reuseBootstrapStore) {
+		// Structural resync after bootstrap — rebuild from scratch; clear all ghosts.
+		ghostClearAll();
+		const prevContextWindow = session.store.contextWindow;
+		const prevBudget = session.store.budget;
+		const prevProtect = session.store.protectTokens;
+		session.store.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
+		session.store = new AccordionStore({
+			meta: session.store.meta,
+			blocks: [],
+			lineCount: 0,
+			skipped: 0,
+		});
+		// Carry forward contextWindow, user-adjusted budget, and protect-tail across resets.
+		if (prevContextWindow !== null) session.store.setContextWindow(prevContextWindow);
+		session.store.setBudget(prevBudget);
+		session.store.setProtect(prevProtect);
+		// Re-attach the completer: a structural reset builds a brand-new store object,
+		// so the reference from the hello path is gone. The socket is still live.
+		session.store.completer = sendCompletion;
+		session.store.wireAttached = true; // socket still live after structural reset (issue #13)
+	}
+	// Update contextWindow from the sync (refreshed each context hook, and pushed
+	// immediately on a `/model` swap). Budget stays at default (70k) — don't
+	// override with contextWindow.
+	const cw = msg.contextWindow;
+	if (typeof cw === "number" && cw > 0) {
+		session.store.setContextWindow(cw);
+	}
+	// Committed blocks arrive HERE (the appendBlocks path), NEVER from ghost state.
+	// Invariant: a ghost is only removed, never converted to a block.
+	session.store.appendBlocks(msg.blocks.map(wireToBlock));
+	let plan = computePlan();
+	// Over-budget safety: wait for fresh conductor commands (or floor). Skipped when folding
+	// is disarmed (the live model call is opt-in untouched) or no remote conductor is attached
+	// (the built-in, if attached, has already folded all it can during the appendBlocks refold
+	// above). `freshCommands` resolves null on dead/not-greeted/timeout → deterministic floor.
+	const runner = activeRemoteRunner();
+	if (folding.enabled && runner && session.store.overBudget) {
+		const cmds = runner.isDead ? null : await runner.freshCommands(CONDUCTOR_WAIT_MS);
+		if (cmds === null) {
+			// Conductor absent/dead/silent → deterministic safety floor. This single
+			// refold-with-builtin owns the result; do not refold again afterwards.
+			session.store.refold(new BuiltinConductor());
+			if (session.store.overBudget) {
+				console.error(
+					`[accordion] fallback remains over budget (${session.store.liveTokens}/${session.store.budget}); protected content is irreducible`,
+				);
+			}
+		}
+		// (cmds !== null) the conductor/commands handler already refolded with the fresh
+		// state; just recompute the plan from the now-current store.
+		plan = computePlan();
+	}
+	const reply: PlanMessage = { type: "plan", reqId: msg.reqId, ops: plan.ops, groups: plan.groups };
+	const ws = socket;
+	if (!ws || ws.readyState !== WebSocket.OPEN) return;
+	try {
+		ws.send(JSON.stringify(reply));
+	} catch {
+		/* socket gone — extension will time out and pass through */
+	}
 }
 
 /**
@@ -216,7 +325,7 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 	// Use window.location.hostname as the WS host when served remotely (browser-host
 	// mode accessed across the network — e.g. a WSL pi reached from a laptop over
 	// Tailscale). Default to 127.0.0.1 for the desktop Tauri app or non-DOM contexts.
-	const wsHost = typeof window !== "undefined" && window.location.hostname ? window.location.hostname : "127.0.0.1";
+	const wsHost = typeof window?.location?.hostname === "string" ? window.location.hostname : "127.0.0.1";
 	live.detail = `ws://${wsHost}:${port}`;
 	live.sessionId = null;
 	session.error = "";
@@ -269,6 +378,7 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 			sendArmed(true);
 			// Structural reset: clear all ghosts — no ghost survives a session reconnect.
 			ghostClearAll();
+			awaitingInitialFullSync = true;
 			session.store?.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
 			session.store = new AccordionStore({
 				meta: { format: "pi", title: msg.meta.title || "live pi session", cwd: msg.meta.cwd || "", model: msg.meta.model || "", sessionId: typeof msg.sessionId === "string" ? msg.sessionId : undefined },
@@ -286,46 +396,12 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 				// Budget stays at default (70k). Don't override with contextWindow.
 			}
 		} else if (msg.type === "sync") {
-			if (!session.store) return;
-			if (msg.full) {
-				// structural reset — rebuild from scratch; clear all ghosts.
-				ghostClearAll();
-				const prevContextWindow = session.store.contextWindow;
-				const prevBudget = session.store.budget;
-				const prevProtect = session.store.protectTokens;
-				session.store.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
-				session.store = new AccordionStore({
-					meta: session.store.meta,
-					blocks: [],
-					lineCount: 0,
-					skipped: 0,
-				});
-				// Carry forward contextWindow, user-adjusted budget, and protect-tail across resets.
-				if (prevContextWindow !== null) session.store.setContextWindow(prevContextWindow);
-				session.store.setBudget(prevBudget);
-				session.store.setProtect(prevProtect);
-				// Re-attach the completer: a structural reset builds a brand-new store object,
-				// so the reference from the hello path is gone. The socket is still live.
-				session.store.completer = sendCompletion;
-				session.store.wireAttached = true; // socket still live after structural reset (issue #13)
-			}
-			// Update contextWindow from the sync (refreshed each context hook, and pushed
-			// immediately on a `/model` swap). Budget stays at default (70k) — don't
-			// override with contextWindow.
-			const cw = msg.contextWindow;
-			if (typeof cw === "number" && cw > 0) {
-				session.store.setContextWindow(cw);
-			}
-			// Committed blocks arrive HERE (the appendBlocks path), NEVER from ghost state.
-			// Invariant: a ghost is only removed, never converted to a block.
-			session.store.appendBlocks(msg.blocks.map(wireToBlock));
-			const plan = computePlan();
-			const reply: PlanMessage = { type: "plan", reqId: msg.reqId, ops: plan.ops, groups: plan.groups };
-			try {
-				ws.send(JSON.stringify(reply));
-			} catch {
-				/* socket gone — extension will time out and pass through */
-			}
+			// Sync handling is async (it may await a remote conductor for fresh folds when over
+			// budget) and serialized via `syncChain` so concurrent syncs cannot overlap or ship
+			// plans out of reqId order. See `handleSync` for the over-budget safety path.
+			syncChain = syncChain.then(() => handleSync(msg)).catch((e) => {
+				console.error("[accordion] sync handler failed", e);
+			});
 		} else if (msg.type === "unfoldRequest") {
 			// The live agent asked (via the `unfold` tool) to restore folded blocks it saw
 			// tagged `{#<code> FOLDED}`. Resolve each code to its folded block(s) and hold
@@ -438,6 +514,8 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 		// new socket's connecting/connected state back to idle.
 		if (socket === ws) {
 			socket = null;
+			awaitingInitialFullSync = false;
+			closeActiveRemote();
 			live.sessionId = null;
 			// Clear the completion backend so `host.can("complete")` returns false while
 			// disconnected. Drain any pending completion promises with a disconnection error
@@ -455,6 +533,8 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 
 export function disconnectLive(): void {
 	manualClose = true;
+	awaitingInitialFullSync = false;
+	closeActiveRemote();
 	// Guaranteed teardown (invariant #2): explicit disconnect clears all ghosts
 	// immediately, before the socket close fires.
 	ghostClearAll();
